@@ -187,7 +187,7 @@ Individual commands may expose additional refusal states in their JSON payloads;
 uv run --with pytest pytest -q
 ```
 
-The suite covers receipt reconciliation, unit and cumulative checks, loop deduplication, schema drift, two-reading revisions, cross-harness witnesses, polling shares, nested scope, day-level cross-checks, and arbitration between record-sum and message-id-merged totals.
+The suite covers receipt reconciliation, unit and cumulative checks, loop deduplication, schema drift, two-reading revisions, cross-harness witnesses, polling shares, nested scope, day-level cross-checks, arbitration between record-sum and message-id-merged totals, and that every command can format its own `--help`.
 
 ## Limitations
 

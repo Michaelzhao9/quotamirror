@@ -2962,7 +2962,9 @@ def _add_floor_args(parser):
         default=None,
         help=(
             "a day counts as a match when the two numbers are within this fraction of each other "
-            f"(default {DEFAULT_TOLERANCE} = {round(DEFAULT_TOLERANCE * 100)}%)"
+            # argparse formats help with `%` substitution, so a literal percent is `%%`;
+            # writing `2%` here crashed `--help` on the two commands that take this floor.
+            f"(default {DEFAULT_TOLERANCE} = {round(DEFAULT_TOLERANCE * 100)}%%)"
         ),
     )
 
