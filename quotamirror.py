@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 TOKEN_BUCKETS = (
     "inputTokens",
@@ -1134,6 +1134,295 @@ def render_drift(payload):
     )
     lines.append("LIMIT: no values are stored - only paths and type names.")
     return "\n".join(lines) + "\n"
+
+
+# A receipt does not only describe the present. Read the same key twice and the
+# second reading can carry a *smaller* number, because the vendor recomputed
+# history. That is the one direction a monotone counter cannot legitimately take,
+# so a decrease is the only change here that needs no further explanation - and
+# it is a rewrite of the record, not less work having happened.
+READINGS_SCHEMA = 1
+
+# Bounded on purpose: two readings make a revision visible, five make a trend
+# visible, and a year of readings of a 200-day receipt is somebody's whole
+# history sitting in a cache file for no reason.
+MAX_READINGS = 5
+
+READING_STORE_DEFAULT = Path.home() / ".cache" / "quotamirror" / "readings.json"
+
+
+def reading_of(receipt):
+    """The token numbers a second reading must agree with, keyed by what they count.
+
+    Two families, both non-decreasing by construction: a per-model lifetime total
+    and one cell per (day, model). Message counts are deliberately left out - they
+    are a different unit, and mixing units is what makes a delta unreadable.
+    """
+    values = {}
+    models = receipt.get("modelUsage") or {}
+    if isinstance(models, dict):
+        for name, usage in models.items():
+            if isinstance(usage, dict):
+                values[f"model:{name}"] = _tokens_for(usage)
+    days = receipt.get("dailyModelTokens") or []
+    if isinstance(days, list):
+        for entry in days:
+            if not isinstance(entry, dict):
+                continue
+            day = entry.get("date")
+            by_model = entry.get("tokensByModel") or {}
+            if not isinstance(day, str) or not isinstance(by_model, dict):
+                continue
+            for name, tokens in by_model.items():
+                if isinstance(tokens, (int, float)) and not isinstance(tokens, bool):
+                    values[f"day:{day}:{name}"] = int(tokens)
+    key, _ = _version_of(receipt)
+    return {
+        "values": values,
+        "version_key": key,
+        "last_computed": receipt.get("lastComputedDate"),
+    }
+
+
+def load_readings(store_path):
+    try:
+        with open(store_path, "r", encoding="utf-8") as handle:
+            store = json.load(handle)
+    except FileNotFoundError:
+        return {"schema": READINGS_SCHEMA, "caches": {}}
+    if not isinstance(store, dict) or not isinstance(store.get("caches"), dict):
+        raise ValueError(f"{store_path} is not a quotamirror readings store")
+    return store
+
+
+def record_reading(store_path, cache_path, receipt, recorded_at=None):
+    """Append this receipt's numbers under its path digest, keeping the newest few."""
+    store_path = Path(store_path)
+    if store_path.is_symlink():
+        raise ValueError(f"refusing symlink readings store: {store_path}")
+    store = load_readings(store_path)
+    if store.get("schema") != READINGS_SCHEMA:
+        store = {"schema": READINGS_SCHEMA, "caches": {}}
+    reading = reading_of(receipt)
+    reading["at"] = recorded_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    entry = store["caches"].setdefault(path_identity(cache_path), {})
+    readings = entry.setdefault("readings", [])
+    readings.append(reading)
+    del readings[:-MAX_READINGS]
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary = tempfile.mkstemp(prefix=f".{store_path.name}.", dir=store_path.parent)
+    try:
+        os.fchmod(handle, 0o600)
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            json.dump(store, out, indent=2)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        if store_path.is_symlink():
+            raise ValueError(f"refusing symlink readings store: {store_path}")
+        os.replace(temporary, store_path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    return store, reading
+
+
+def revise_report(store, cache_path, receipt):
+    """Compare this receipt's numbers with the most recent earlier reading."""
+    current = reading_of(receipt)
+    entry = (store.get("caches") or {}).get(path_identity(cache_path)) or {}
+    readings = entry.get("readings") or []
+    earlier = readings[-1] if readings else None
+    payload = {
+        "source": str(cache_path),
+        "version_key": current["version_key"],
+        "last_computed": current["last_computed"],
+        "keys_now": len(current["values"]),
+        "keys_earlier": len(earlier["values"]) if earlier else 0,
+        "baseline_at": earlier.get("at") if earlier else None,
+        "baseline_version_key": earlier.get("version_key") if earlier else None,
+        "baseline_last_computed": earlier.get("last_computed") if earlier else None,
+        "measurable": bool(earlier),
+        "verdict": "no_baseline",
+        "compared": 0,
+        "down": 0,
+        "up": 0,
+        "flat": 0,
+        "net_delta": 0,
+        "closed_day_changes": 0,
+        "appeared": [],
+        "vanished": [],
+        "rows": [],
+    }
+    if not earlier:
+        return payload
+
+    before = earlier.get("values") or {}
+    now = current["values"]
+    payload["appeared"] = sorted(set(now) - set(before))
+    payload["vanished"] = sorted(set(before) - set(now))
+    closed_before = earlier.get("last_computed")
+
+    rows = []
+    for key in sorted(set(before) & set(now)):
+        delta = now[key] - before[key]
+        if delta < 0:
+            verdict = "revised_down"
+        elif delta > 0:
+            verdict = "increased"
+        else:
+            verdict = "unchanged"
+        closed = False
+        if key.startswith("day:") and isinstance(closed_before, str):
+            # the earlier receipt already declared this day computed, so no new
+            # work can be attributed to it; a change here is the entry itself
+            closed = key.split(":", 2)[1] < closed_before
+        rows.append(
+            {
+                "key": key,
+                "earlier": before[key],
+                "now": now[key],
+                "delta": delta,
+                "verdict": verdict,
+                "closed": closed,
+            }
+        )
+
+    payload["rows"] = rows
+    payload["compared"] = len(rows)
+    payload["down"] = sum(1 for row in rows if row["delta"] < 0)
+    payload["up"] = sum(1 for row in rows if row["delta"] > 0)
+    payload["flat"] = len(rows) - payload["down"] - payload["up"]
+    payload["net_delta"] = sum(row["delta"] for row in rows)
+    payload["closed_day_changes"] = sum(
+        1 for row in rows if row["closed"] and row["delta"] != 0
+    )
+    if payload["down"]:
+        payload["verdict"] = "history_revised"
+    elif payload["up"]:
+        payload["verdict"] = "growth_only"
+    elif rows:
+        payload["verdict"] = "unchanged"
+    else:
+        payload["verdict"] = "not_comparable"
+    return payload
+
+
+def _signed(value):
+    return f"+{value:,}" if value > 0 else f"{value:,}"
+
+
+def render_revise(payload, recorded=True):
+    lines = ["RECEIPT REVISIONS (the same keys, read twice)"]
+    lines.append(f"  source:   {payload['source']}")
+    lines.append(
+        f"  receipt:  version {payload['version_key']}, "
+        f"lastComputedDate {payload['last_computed']}"
+    )
+    lines.append("")
+    if not payload["measurable"]:
+        lines.append("  this is the first reading of these keys: there is no earlier reading")
+        lines.append("  in the store, so nothing can be compared yet.")
+        lines.append(f"  recorded: {payload['keys_now']} keys.")
+        if recorded:
+            lines.append(
+                "  run `quotamirror revise` again later - the second reading is what makes"
+            )
+            lines.append("  a revision visible; one reading can only show the present.")
+        else:
+            lines.append(
+                "  --no-record: nothing was written, so the next run will also be a first reading."
+            )
+        return "\n".join(lines) + "\n"
+
+    lines.append(
+        f"  earlier:  {payload['baseline_at']}  version {payload['baseline_version_key']}, "
+        f"lastComputedDate {payload['baseline_last_computed']}"
+    )
+    lines.append(
+        f"  now:      version {payload['version_key']}, "
+        f"lastComputedDate {payload['last_computed']}"
+    )
+    lines.append("")
+    lines.append(f"  {'key'.ljust(44)} {'earlier':>14} {'now':>14} {'delta':>14}")
+    for row in payload["rows"]:
+        mark = "" if row["verdict"] == "unchanged" else f"  {row['verdict']}"
+        if row["closed"] and row["delta"] != 0:
+            mark += " (closed day)"
+        lines.append(
+            f"  {row['key'].ljust(44)} {row['earlier']:>14,} {row['now']:>14,} "
+            f"{_signed(row['delta']):>14}{mark}"
+        )
+    lines.append("")
+    lines.append(
+        f"  keys compared: {payload['compared']} of {payload['keys_earlier']} earlier / "
+        f"{payload['keys_now']} now; {payload['down']} down, {payload['up']} up, "
+        f"{payload['flat']} unchanged; net {_signed(payload['net_delta'])} tokens."
+    )
+    if payload["appeared"]:
+        lines.append(
+            f"  appeared in this reading only ({len(payload['appeared'])}): "
+            f"{', '.join(payload['appeared'][:4])}"
+            + (" ..." if len(payload["appeared"]) > 4 else "")
+        )
+    if payload["vanished"]:
+        lines.append(
+            f"  present earlier, absent now ({len(payload['vanished'])}): "
+            f"{', '.join(payload['vanished'][:4])}"
+            + (" ..." if len(payload["vanished"]) > 4 else "")
+        )
+        lines.append(
+            "  absent is not zero: a key that stopped being published was not revised"
+            " downwards, and it is not counted above."
+        )
+    lines.append(f"  verdict: {payload['verdict']}")
+    lines.append("")
+    if payload["down"]:
+        lines.append(
+            "  A key that reads lower the second time was revised: the receipt's past was"
+        )
+        lines.append(
+            "  rewritten. It is not less usage - the same key cannot un-spend tokens - and"
+        )
+        lines.append("  this command will not call it a drop in consumption.")
+    elif payload["up"]:
+        lines.append(
+            "  Every change is upward, which is what new work looks like. Two readings"
+        )
+        lines.append(
+            "  cannot separate new work from a late write onto an older day; only the"
+        )
+        lines.append("  downward direction is unambiguous.")
+    elif payload["compared"]:
+        lines.append("  Both readings carry the same numbers for every comparable key.")
+    else:
+        lines.append(
+            "  No key is present in both readings, so no revision can be stated either way."
+        )
+    # A closed day is not only interesting when the number went down: the earlier
+    # receipt had already declared it computed, so a change in either direction is
+    # the entry being rewritten rather than work landing on it.
+    if payload["closed_day_changes"]:
+        count = payload["closed_day_changes"]
+        if count == 1:
+            lines.append(
+                "  1 changed key sits on a day the earlier receipt had already declared"
+            )
+        else:
+            lines.append(
+                f"  {count} changed keys sit on days the earlier receipt had already declared"
+            )
+        lines.append(
+            "  computed, where a change is the record being rewritten rather than work"
+        )
+        lines.append("  being added.")
+    lines.append("  LIMIT: only downloaded receipts are read; a revision made before the")
+    lines.append("  earlier reading, or after this one, is outside both snapshots.")
+    return "\n".join(lines) + "\n"
+
+
 
 
 # A rollout's own session_meta says whether it is a root thread or a delegated
@@ -2972,6 +3261,23 @@ def main(argv=None):
     drift.add_argument(
         "--no-record", action="store_true", help="compare without writing a snapshot"
     )
+    revise = sub.add_parser(
+        "revise",
+        help=(
+            "the same keys read twice: both readings and the signed difference, so a "
+            "downward revision is not reported as less usage"
+        ),
+    )
+    revise.add_argument("--path", default=str(Path.home() / ".claude" / "stats-cache.json"))
+    revise.add_argument(
+        "--store",
+        default=str(READING_STORE_DEFAULT),
+        help="where earlier readings are kept (token numbers under a path digest, mode 0600)",
+    )
+    revise.add_argument("--json", action="store_true", help="machine-readable payload")
+    revise.add_argument(
+        "--no-record", action="store_true", help="compare without recording this reading"
+    )
     nested = sub.add_parser(
         "nested",
         help=(
@@ -3021,7 +3327,6 @@ def main(argv=None):
         help="add COORDINATION SPEND: share of turns that only polled, always with its denominator",
     )
     args = parser.parse_args(argv)
-
     if args.command in {"nested", "compare"}:
         try:
             _floor(args.min_tokens, args.tolerance)
@@ -3093,6 +3398,34 @@ def main(argv=None):
             if args.poll_share:
                 text += "\n" + render_poll_share(payload["poll_share"])
             sys.stdout.write(text)
+        return 0
+
+    if args.command == "revise":
+        cache_path = os.path.abspath(args.path)
+        try:
+            cache = load_cache(cache_path)
+        except OSError as exc:
+            print(f"quotamirror: cannot read {cache_path}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(f"quotamirror: {exc}", file=sys.stderr)
+            return 2
+        store_path = Path(args.store)
+        try:
+            # compare against what was already on disk, then append this reading:
+            # one reading can only show the present, two make a revision visible
+            store = load_readings(store_path)
+            payload = revise_report(store, cache_path, cache)
+            if not args.no_record:
+                record_reading(store_path, cache_path, cache)
+        except (OSError, ValueError) as exc:
+            print(f"quotamirror: cannot use store {store_path}: {exc}", file=sys.stderr)
+            return 2
+        payload = redact_home(payload)
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            sys.stdout.write(render_revise(payload, recorded=not args.no_record))
         return 0
 
     if args.command == "drift":

@@ -71,6 +71,21 @@ python3 quotamirror.py drift --store ./shapes.json --path ./fixture.json
 
 Stores a format-version marker plus a normalized schema: dotted field paths and type names grouped by declared receipt version. Model dictionary keys are replaced with `<model>`, date-shaped dictionary keys with `<date>`, and the receipt is identified by a SHA-256 digest of its canonical path rather than by the path itself. Capture timestamps, counters, receipt values, and model names are not stored. The store is atomically replaced with mode `0600`; a symlink destination is refused. On the next recording, a legacy schema-1 store is replaced rather than migrated because its keys may contain the private data this format removes.
 
+### `revise` — the same keys, read twice
+
+```bash
+python3 quotamirror.py revise
+python3 quotamirror.py revise --json
+python3 quotamirror.py revise --no-record
+python3 quotamirror.py revise --store ./readings.json --path ./fixture.json
+```
+
+A receipt describes the present, but it is not immutable. The same key read twice can carry a *smaller* number the second time, because the vendor recomputed history. `revise` records one reading — per-model lifetime token totals plus one cell per day and model — and the next run compares against it: both readings, the signed difference, and how many keys were comparable on each side.
+
+Only the downward direction needs no further explanation: a monotone counter cannot un-spend tokens, so a key that reads lower was **revised**, and the report says so instead of calling it less usage. An upward change may be new work or a late write onto an older day, and two readings cannot tell those apart. A key present in only one reading is never counted as zero — it is reported as appeared or absent. A day that the earlier receipt had already declared computed is flagged `closed`, because a change there is the entry being rewritten rather than work landing on it.
+
+The first run prints a first reading and records it; the second is what makes a revision visible. The store keeps the newest five readings per receipt under a SHA-256 digest of the receipt's path, atomically replaced with mode `0600` (a symlink destination is refused). It holds token numbers and model IDs — not paths, prompts, or transcript text.
+
 ### `compare` — cross-harness accounting
 
 ```bash
@@ -123,6 +138,7 @@ The expected result is not a guessed bill. It is a receipt stating that the pric
 6. **Windows must match.** Different date ranges are compared as coverage, not bills.
 7. **No evidence means no verdict.** Missing transcripts or baselines produce unavailable/no-baseline states.
 8. **Read-only toward harnesses.** The tool never changes vendor caches or transcripts.
+9. **A decrease is a revision, not less usage.** A monotone counter read twice can only read lower if the record was rewritten.
 
 ## Privacy
 
@@ -130,6 +146,7 @@ The expected result is not a guessed bill. It is a receipt stating that the pric
 - Transcript text and tool arguments are never returned in reports.
 - `loop` hashes arguments in memory and stores no argument values.
 - `drift` stores a format-version marker, normalized field paths, type names, declared version keys, and a non-reversible path digest. It does not store absolute receipt paths, model names, capture times, counters, or receipt values. Writes use atomic replacement with mode `0600`, and symlink store destinations are refused.
+- `revise` stores per-reading token numbers and model IDs under a non-reversible path digest, keeps the newest five readings, and writes with mode `0600` through atomic replacement (symlink destinations are refused). It stores no absolute paths, prompts, or transcript text; `--no-record` writes nothing at all.
 - Human and JSON reports replace the current home-directory prefix with `~` by default. Explicit paths outside the current home are left unchanged.
 - Tests and documentation contain synthetic fixtures only.
 - This repository contains no personal usage totals, captured local usernames, prompts, credentials, or transcript content.
@@ -149,7 +166,7 @@ Individual commands may expose additional refusal states in their JSON payloads;
 uv run --with pytest pytest -q
 ```
 
-The suite covers receipt reconciliation, unit and cumulative checks, loop deduplication, schema drift, cross-harness witnesses, polling shares, nested scope, day-level cross-checks, and arbitration between record-sum and message-id-merged totals.
+The suite covers receipt reconciliation, unit and cumulative checks, loop deduplication, schema drift, two-reading revisions, cross-harness witnesses, polling shares, nested scope, day-level cross-checks, and arbitration between record-sum and message-id-merged totals.
 
 ## Limitations
 
@@ -161,6 +178,7 @@ The suite covers receipt reconciliation, unit and cumulative checks, loop dedupl
 - Timestamp windows are bounded by records with usable timestamps.
 - Scope depends on the harness exposing root/subagent metadata.
 - A schema field that keeps the same name and type but changes meaning is invisible to `drift`.
+- `revise` only sees the readings it recorded: a revision made before the first reading, or after the latest, falls outside both snapshots. Two readings also cannot separate new work from a late write onto an older day.
 
 ## License
 
