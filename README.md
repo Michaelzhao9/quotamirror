@@ -100,6 +100,16 @@ Compares Codex rollout deltas, running totals, and response records with Claude 
 
 `--poll-share` reports coordination-only turns at both request and user-turn granularity, with tokens and turn counts printed beside each percentage.
 
+With `--claude-transcripts`, the CLAUDE section prints the same `observation` line as `nested`, and a scan that read nothing is reported as an unmeasured second window instead of being placed beside the cache's:
+
+```text
+  transcript   : not measured -- store_empty -- no transcript file was read under --claude-transcripts, so the second window was never measured (an empty scan is an absence of observation, not an observation of zero usage)
+  observation   : store_empty -- 0 file(s) read, 0 usage record(s) read
+  cache table  : 2026-05-03..2026-10-25 (38 day(s), basis=declared_attribution)
+```
+
+Without the flag the line reads `not_read` and names the flag that would measure it, so the three zeros (unread, empty store, no usage records) never look alike.
+
 ### `nested` — root and subagent scope
 
 ```bash
@@ -113,6 +123,16 @@ python3 quotamirror.py nested \
 ```
 
 Separates root, sidechain, and combined usage; prints raw-record and message-id-merged totals; and, when a cache is supplied, checks which total the cache's daily cells support.
+
+Every run also prints an `observation` line, because a zero over a directory that held no transcript is not a measured zero:
+
+```text
+  transcripts   : 0 file(s), 0 usage record(s) -> 0 after dedupe by message id
+  observation   : store_empty -- 0 file(s) read, 0 usage record(s) read
+  verdict: unobserved
+```
+
+`store_empty` (nothing was there to read), `no_usage_records` (files were read and none carried a usage block) and `usage_observed` are three different facts, and only the last one supports a statement about usage.
 
 ## Example receipt
 
@@ -137,8 +157,9 @@ The expected result is not a guessed bill. It is a receipt stating that the pric
 5. **A total declares accounting.** Delta and cumulative values are never blended.
 6. **Windows must match.** Different date ranges are compared as coverage, not bills.
 7. **No evidence means no verdict.** Missing transcripts or baselines produce unavailable/no-baseline states.
-8. **Read-only toward harnesses.** The tool never changes vendor caches or transcripts.
-9. **A decrease is a revision, not less usage.** A monotone counter read twice can only read lower if the record was rewritten.
+8. **A zero declares which zero it is.** `store_empty`, `no_usage_records` and `usage_observed` are separate states, and a coverage sentence is not printed about records that were never read.
+9. **Read-only toward harnesses.** The tool never changes vendor caches or transcripts.
+10. **A decrease is a revision, not less usage.** A monotone counter read twice can only read lower if the record was rewritten.
 
 ## Privacy
 
@@ -179,6 +200,7 @@ The suite covers receipt reconciliation, unit and cumulative checks, loop dedupl
 - Scope depends on the harness exposing root/subagent metadata.
 - A schema field that keeps the same name and type but changes meaning is invisible to `drift`.
 - `revise` only sees the readings it recorded: a revision made before the first reading, or after the latest, falls outside both snapshots. Two readings also cannot separate new work from a late write onto an older day.
+- `observation` describes what this run read, not what the harness wrote: a transcript directory that was moved, or a `--max-files` cap that excluded everything, reads as `store_empty` or `no_usage_records` even when the harness holds usage elsewhere. The two are distinguished because one is "nothing here" and the other is "these files had no usage", but neither proves the harness never used a model.
 
 ## License
 

@@ -325,3 +325,116 @@ def test_compare_and_nested_agree_on_the_same_corpus(tmp_path):
 
     assert window["tokens"] == nested["totals"]["all"]["total_tokens"]
     assert window["window"]["first"] == nested["totals"]["all"]["window"]["first"]
+
+
+def test_an_empty_root_is_stamped_as_an_empty_store_and_says_so(tmp_path):
+    window = quotamirror.transcript_window(tmp_path)
+
+    # `compare --claude-transcripts` points at the same kind of directory, so the
+    # same vacuous claim was reachable from a second command.
+    assert window["observation"]["verdict"] == "store_empty"
+    assert "bounds all records read" not in window["coverage"]["note"]
+
+
+# --- Cycle: the second face of "which zero is it" ---------------------------
+# r64 taught `nested` to say whether it read anything. `compare` runs the same
+# scan through transcript_window() and shipped the same silent zero: an empty
+# --claude-transcripts directory produced a "window" out of no records and a
+# residual sentence about days that were never read. The payload already knew;
+# the second output face did not print it.
+
+def test_compare_carries_the_transcript_observation_into_the_window_pair(tmp_path):
+    write_rollout(tmp_path, [meta("2026-05-01T10:00:00Z"), event("2026-05-01T10:00:05Z", 100, 100)])
+    transcripts = write_transcripts(
+        tmp_path / "projects",
+        {
+            "a.jsonl": [
+                usage_line("m1", "2026-05-01T10:00:00Z", 10),
+                usage_line("m2", "2026-05-02T10:00:00Z", 90),
+            ]
+        },
+    )
+    cache = {
+        "modelUsage": {"opus": {"inputTokens": 10, "costUSD": 0.0}},
+        "dailyModelTokens": [{"date": "2026-05-01", "tokensByModel": {"opus": 10}}],
+    }
+    payload = quotamirror.compare_harnesses(tmp_path, cache, claude_transcripts=transcripts)
+    observation = payload["claude_window"]["observation"]
+
+    assert observation["verdict"] == "usage_observed"
+    assert observation["files"] == 1
+    assert observation["usage_records"] == 2
+
+
+def test_an_empty_transcript_dir_is_not_a_measured_window(tmp_path):
+    """Zero files read cannot produce a window; the pair must say so, not compare."""
+    write_rollout(tmp_path, [meta("2026-05-01T10:00:00Z"), event("2026-05-01T10:00:05Z", 100, 100)])
+    empty = tmp_path / "projects"
+    empty.mkdir()
+    cache = {
+        "modelUsage": {"opus": {"inputTokens": 10, "costUSD": 0.0}},
+        "dailyModelTokens": [{"date": "2026-05-01", "tokensByModel": {"opus": 10}}],
+    }
+    payload = quotamirror.compare_harnesses(tmp_path, cache, claude_transcripts=empty)
+    window = payload["claude_window"]
+
+    assert window["observation"]["verdict"] == "store_empty"
+    assert window["available"] is False
+    assert "store_empty" in window["reason"]
+    assert "claude.transcripts" not in payload["stamps"]
+
+
+def test_files_that_carry_no_usage_leave_the_window_unmeasured_by_their_own_name(tmp_path):
+    """A file was read and held nothing: the same refusal, a different reason."""
+    write_rollout(tmp_path, [meta("2026-05-01T10:00:00Z"), event("2026-05-01T10:00:05Z", 100, 100)])
+    transcripts = write_transcripts(
+        tmp_path / "projects", {"a.jsonl": [{"type": "summary", "summary": "no usage here"}]}
+    )
+    cache = {
+        "modelUsage": {"opus": {"inputTokens": 10, "costUSD": 0.0}},
+        "dailyModelTokens": [{"date": "2026-05-01", "tokensByModel": {"opus": 10}}],
+    }
+    payload = quotamirror.compare_harnesses(tmp_path, cache, claude_transcripts=transcripts)
+    window = payload["claude_window"]
+
+    assert window["observation"]["verdict"] == "no_usage_records"
+    assert window["available"] is False
+    assert "no_usage_records" in window["reason"]
+    assert "store_empty" not in window["reason"]
+
+
+def test_the_compare_text_says_how_much_of_the_transcript_was_actually_read(tmp_path):
+    """The section compares two windows; the reader must see what the second read."""
+    write_rollout(tmp_path, [meta("2026-05-01T10:00:00Z"), event("2026-05-01T10:00:05Z", 100, 100)])
+    transcripts = write_transcripts(
+        tmp_path / "projects",
+        {
+            "a.jsonl": [
+                usage_line("m1", "2026-05-01T10:00:00Z", 10),
+                usage_line("m2", "2026-05-02T10:00:00Z", 90),
+            ]
+        },
+    )
+    cache = {
+        "modelUsage": {"opus": {"inputTokens": 10, "costUSD": 0.0}},
+        "dailyModelTokens": [{"date": "2026-05-01", "tokensByModel": {"opus": 10}}],
+    }
+    text = quotamirror.render_compare(
+        quotamirror.compare_harnesses(tmp_path, cache, claude_transcripts=transcripts)
+    )
+    section = text.rsplit("CLAUDE, TWO COUNTERS", 1)[1].split("\nPRICE")[0]
+
+    assert "observation   : usage_observed -- 1 file(s) read, 2 usage record(s) read" in section
+
+
+def test_without_the_flag_the_compare_text_names_the_zero_as_unread(tmp_path):
+    """Not passing the flag is the third zero: nothing was read, by choice."""
+    write_rollout(tmp_path, [meta("2026-05-01T10:00:00Z"), event("2026-05-01T10:00:05Z", 100, 100)])
+    cache = {
+        "modelUsage": {"opus": {"inputTokens": 10, "costUSD": 0.0}},
+        "dailyModelTokens": [{"date": "2026-05-01", "tokensByModel": {"opus": 10}}],
+    }
+    text = quotamirror.render_compare(quotamirror.compare_harnesses(tmp_path, cache))
+
+    assert "observation   : not_read" in text
+    assert "--claude-transcripts was not passed" in text

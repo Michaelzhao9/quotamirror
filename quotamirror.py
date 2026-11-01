@@ -1770,6 +1770,66 @@ def _scope_fields(receipt):
     return sorted(set(names))
 
 
+def _observation(files, usage_records):
+    """Was anything read at all? A zero has to say which kind of zero it is.
+
+    `store_empty` -- no transcript file was even there to read.
+    `no_usage_records` -- files were read and none carried a usage block.
+    `usage_observed` -- at least one usage record was read.
+    """
+    count = len(files)
+    if count == 0:
+        verdict = "store_empty"
+    elif not usage_records:
+        verdict = "no_usage_records"
+    else:
+        verdict = "usage_observed"
+    return {
+        "verdict": verdict,
+        "files": count,
+        "usage_records": usage_records,
+    }
+
+
+def _observation_text(observation):
+    """One line saying how much was read. Shared so every output face uses it."""
+    return (
+        f"{observation['verdict']} -- {observation['files']} file(s) read, "
+        f"{observation['usage_records']:,} usage record(s) read"
+    )
+
+
+NOT_READ = (
+    "not_read -- --claude-transcripts was not passed, so no transcript file was read"
+)
+
+
+def _observation_line(observation, note_when_absent=NOT_READ):
+    """The printed form of an observation, on every face that compares totals."""
+    body = _observation_text(observation) if observation else note_when_absent
+    return f"  observation   : {body}"
+
+
+def _coverage_note(usage_records, untimed):
+    """One sentence about what a printed window actually bounds.
+
+    A scan that read nothing has no window at all, so the honest sentence is not
+    "the window bounds every record" (vacuously true over zero records) but that
+    nothing was measured.
+    """
+    if not usage_records:
+        return (
+            "no usage record was read, so no window was measured -- an empty scan is an "
+            "absence of observation, not an observation of zero usage"
+        )
+    if untimed:
+        return (
+            f"{untimed} usage record(s) carry no timestamp, so the printed window does not bound "
+            "their records; their tokens are still in the total"
+        )
+    return "every usage record carried a timestamp, so the printed window bounds all records read"
+
+
 def _window(days, basis="none"):
     """Which days a total covers and how that coverage was learned.
 
@@ -1851,11 +1911,34 @@ def _claude_window_pair(claude_days, cache_window, claude_transcripts):
         "cache": cache_window,
         "transcript": None,
         "transcript_scan": None,
+        "observation": None,
     }
     if claude_transcripts is None:
         return unavailable
 
     scan = transcript_window(claude_transcripts)
+    observation = scan["observation"]
+    if observation["verdict"] != "usage_observed":
+        # Nothing was read, or nothing read carried usage: either way there is no
+        # second window to place beside the cache's, and the zero must say which.
+        detail = {
+            "store_empty": "no transcript file was read under --claude-transcripts",
+            "no_usage_records": (
+                f"{observation['files']} transcript file(s) were read under --claude-transcripts and "
+                "none carried a usage record"
+            ),
+        }[observation["verdict"]]
+        return {
+            "available": False,
+            "reason": (
+                f"{observation['verdict']} -- {detail}, so the second window was never measured "
+                "(an empty scan is an absence of observation, not an observation of zero usage)"
+            ),
+            "cache": cache_window,
+            "transcript": None,
+            "transcript_scan": None,
+            "observation": observation,
+        }
     transcript_days = set(scan["day_totals"])
     cache_days = set(claude_days)
     only_transcript = sorted(transcript_days - cache_days)
@@ -1887,6 +1970,7 @@ def _claude_window_pair(claude_days, cache_window, claude_transcripts):
         "cache": cache_window,
         "transcript": scan["window"],
         "transcript_scan": scan,
+        "observation": scan["observation"],
         "days_transcript_only": only_transcript,
         "days_cache_only": only_cache,
         "days_both": both,
@@ -2221,10 +2305,12 @@ def render_compare(payload):
     pair = payload["claude_window"]
     if not pair["available"]:
         lines.append(f"  transcript   : not measured -- {pair['reason']}")
+        lines.append(_observation_line(pair["observation"]))
         lines.append(f"  cache table  : {_window_text(pair['cache'])}")
     else:
         lines.append(f"  transcript   : {_window_text(pair['transcript'])}"
                      f"  [{_stamp_text(stamps['claude.transcripts'])}]")
+        lines.append(_observation_line(pair["observation"]))
         lines.append(f"  cache table  : {_window_text(pair['cache'])}  [{_stamp_text(stamps['claude.daily'])}]")
         lines.append(f"  days in both : {len(pair['days_both'])}"
                      f" | transcript only: {len(pair['days_transcript_only'])}"
@@ -2809,17 +2895,11 @@ def transcript_window(root, max_files=None):
         "window": _window(set(day_totals), "record_timestamp"),
         "day_totals": day_totals,
         "days": scan["days"],
+        "observation": _observation(scan["files"], scan["records"]),
         "coverage": {
             "records_timed": scan["records_timed"],
             "records_without_timestamp": untimed,
-            "note": (
-                "every usage record carried a timestamp, so the printed window bounds all records read"
-                if not untimed
-                else (
-                    f"{untimed} usage record(s) carry no timestamp, so the printed window does not bound "
-                    "their records; tokens from them are still in the total"
-                )
-            ),
+            "note": _coverage_note(scan["records"], untimed),
         },
     }
 
@@ -2945,6 +3025,7 @@ def nested_audit(root, max_files=None, cache=None, min_tokens=None, tolerance=No
             transcript_days = days
 
     deduped_tokens = totals["all"]["total_tokens"]
+    observation = _observation(files, raw_records)
     sidechain_messages = totals["sidechain"]["messages"]
     share_denominator = sum(totals["all"]["tokens"][b] for b in NON_CACHE_BUCKETS)
     share_numerator = sum(totals["sidechain"]["tokens"][b] for b in NON_CACHE_BUCKETS)
@@ -2962,7 +3043,7 @@ def nested_audit(root, max_files=None, cache=None, min_tokens=None, tolerance=No
             "messages": 0,
             "messages_pct": None,
         }
-        verdict = "no_usage"
+        verdict = "unobserved" if observation["verdict"] == "store_empty" else "no_usage"
     else:
         share = {
             "available": True,
@@ -2998,16 +3079,8 @@ def nested_audit(root, max_files=None, cache=None, min_tokens=None, tolerance=No
     coverage = {
         "records_timed": timed,
         "records_without_timestamp": untimed,
-        "note": (
-            "every usage record carried a timestamp, so the printed window bounds all records read"
-            if not untimed
-            else (
-                f"{untimed} usage record(s) carry no timestamp: the printed window bounds only the "
-                "timed ones, so a record outside that range would not move it"
-            )
-        ),
+        "note": _coverage_note(raw_records, untimed),
     }
-
     cache_days = set()
     cache_day_totals = {}
     cache_window = None
@@ -3052,6 +3125,7 @@ def nested_audit(root, max_files=None, cache=None, min_tokens=None, tolerance=No
     return {
         "files": len(files),
         "records_raw": raw_records,
+        "observation": observation,
         "coverage": coverage,
         "windows": windows,
         "records_deduped": len(order),
@@ -3126,6 +3200,8 @@ def render_nested(payload):
         f"  transcripts   : {payload['files']} file(s), {payload['records_raw']:,} usage record(s) "
         f"-> {payload['records_deduped']:,} after dedupe by message id"
     )
+    observation = payload["observation"]
+    lines.append(_observation_line(observation, NOT_READ))
     lines.append("  totals")
     for scope in ("all", "root", "sidechain"):
         total = payload["totals"][scope]

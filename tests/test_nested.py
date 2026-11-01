@@ -450,3 +450,69 @@ def test_render_names_the_day_where_repeated_writes_inflated_the_record_sum_most
     assert "2026-05-01" in text
     assert "100 tokens" in text
     assert "210" in text
+
+
+# --- Cycle: zero is not a measurement ---------------------------------------
+# An empty directory and a measured absence both used to print "no_usage". The
+# coverage sentence then claimed "the printed window bounds all records read"
+# over a scan that read nothing: a vacuous claim in the product that exists to
+# refuse vacuous claims. A reader has to be able to tell "there was nothing to
+# read" from "I read it and it was empty".
+
+
+def test_an_empty_transcript_dir_is_an_empty_store_not_a_measured_no_usage(tmp_path):
+    payload = quotamirror.nested_audit(tmp_path)
+
+    assert payload["observation"]["verdict"] == "store_empty"
+    assert payload["observation"]["files"] == 0
+    assert payload["observation"]["usage_records"] == 0
+
+
+def test_the_coverage_note_does_not_claim_a_window_it_never_measured(tmp_path):
+    payload = quotamirror.nested_audit(tmp_path)
+
+    note = payload["coverage"]["note"]
+    assert "bounds all records read" not in note
+    assert "no usage record was read" in note
+
+
+def test_files_with_no_usage_block_are_a_measured_absence_not_an_empty_store(tmp_path):
+    write(tmp_path / "a.jsonl", [{"type": "user", "uuid": "u1", "message": {"role": "user"}}])
+
+    payload = quotamirror.nested_audit(tmp_path)
+
+    # One file was read and it held no usage. That is a different fact from
+    # "there was nothing to read", and it is the one a reader can act on.
+    assert payload["observation"]["verdict"] == "no_usage_records"
+    assert payload["observation"]["files"] == 1
+    assert payload["observation"]["usage_records"] == 0
+
+
+def test_the_rendered_receipt_prints_which_kind_of_zero_it_is(tmp_path):
+    text = quotamirror.render_nested(quotamirror.nested_audit(tmp_path))
+
+    observation = [row for row in text.splitlines() if row.strip().startswith("observation")]
+
+    assert len(observation) == 1
+    assert "store_empty" in observation[0]
+    assert "bounds all records read" not in text
+
+
+def test_cli_nested_on_an_empty_directory_prints_the_observation(tmp_path):
+    proc = subprocess.run(
+        [sys.executable, str(Path(quotamirror.__file__)), "nested", "--path", str(tmp_path)],
+        capture_output=True,
+        text=True,
+    )
+
+    assert proc.returncode == 0, proc.stderr
+    assert "store_empty" in proc.stdout
+    assert "bounds all records read" not in proc.stdout
+
+
+def test_an_empty_store_refuses_to_issue_a_usage_verdict(tmp_path):
+    # "no_usage" is a claim about usage. Over a directory holding no transcript
+    # there is nothing to have made that claim from.
+    payload = quotamirror.nested_audit(tmp_path)
+
+    assert payload["verdict"] == "unobserved"
