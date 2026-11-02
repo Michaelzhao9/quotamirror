@@ -41,6 +41,14 @@ python3 quotamirror.py scan --json
 
 Reports per-model and per-day totals, signed gaps, days with activity but no token records, price status, and snapshot age.
 
+A receipt can be recognisable and still hold no `modelUsage` entries — a half-written
+cache, or one whose per-model field was renamed. The sum over an empty dict is not a
+measurement, so the section prints `not measured` with the reason instead of
+`TOTAL 0`, the attribution line refuses to compare one view, and a receipt with no
+days at all no longer claims every activity day has a token record. When the day view
+(`dailyModelTokens`) does hold tokens, `scan` prints that sum with its day count next
+to the refusal, labelled as a lower bound rather than the lifetime total.
+
 ### `units` — audit magnitude and counter shape
 
 ```bash

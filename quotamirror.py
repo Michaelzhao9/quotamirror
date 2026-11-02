@@ -54,13 +54,19 @@ def summarize(cache, today=None):
             ),
         }
     else:
+        models_seen = len(by_model)
         dollars = {
             "status": "unknown",
             "usd": None,
             "models_with_zero_unpriced": len(unpriced),
             "reason": (
-                f"{len(unpriced)} of {len(by_model)} models record costUSD = 0.00 while "
-                f"{total:,} tokens were seen; 0.00 is the meter's placeholder, not a price"
+                "this receipt carries no modelUsage entries, so no model carries a "
+                "price and 0.00 is an absent meter, not a free one"
+                if not models_seen
+                else (
+                    f"{len(unpriced)} of {models_seen} models record costUSD = 0.00 while "
+                    f"{total:,} tokens were seen; 0.00 is the meter's placeholder, not a price"
+                )
             ),
         }
 
@@ -68,8 +74,25 @@ def summarize(cache, today=None):
     day_series = [{"date": name, "tokens": daily_per_day[name]} for name in sorted(daily_per_day)]
     busiest_day = max(day_series, key=lambda d: d["tokens"]) if day_series else None
 
+    # An empty `modelUsage` makes the lifetime total an empty sum, not a measurement.
+    # Report the absence instead, and name the day view when that view does hold tokens.
+    measured = bool(by_model)
+    day_view_total = sum(daily_per_day.values())
+
     return {
-        "tokens": {"total": total, "by_model": by_model},
+        "tokens": {
+            "total": total,
+            "by_model": by_model,
+            "measured": measured,
+            "reason": None
+            if measured
+            else (
+                "this receipt carries no modelUsage entries, so the file holds no "
+                "lifetime total to report"
+            ),
+            "day_view_total": day_view_total,
+            "day_view_days": len(daily_per_day),
+        },
         "dollars": dollars,
         "models_total": len(by_model),
         "attribution": _attribution(cache, by_model),
@@ -601,10 +624,19 @@ def render_text(payload, source="(unknown)"):
 
     tokens = payload["tokens"]
     lines.append("TOKENS (lifetime, all four buckets)")
-    ranked = sorted(tokens["by_model"].items(), key=lambda kv: kv[1]["tokens"], reverse=True)
-    for model, entry in ranked:
-        lines.append(f"  {model:<26}{_fmt(entry['tokens']):>16}  {entry['share'] * 100:5.1f}%")
-    lines.append(f"  {'TOTAL':<26}{_fmt(tokens['total']):>16}")
+    if tokens["measured"]:
+        ranked = sorted(tokens["by_model"].items(), key=lambda kv: kv[1]["tokens"], reverse=True)
+        for model, entry in ranked:
+            lines.append(f"  {model:<26}{_fmt(entry['tokens']):>16}  {entry['share'] * 100:5.1f}%")
+        lines.append(f"  {'TOTAL':<26}{_fmt(tokens['total']):>16}")
+    else:
+        lines.append(f"  not measured - {tokens['reason']}")
+        if tokens["day_view_days"]:
+            lines.append(
+                f"  the day view in the same file sums to {_fmt(tokens['day_view_total'])} "
+                f"over {tokens['day_view_days']} day(s) - that number is a lower bound "
+                "on the days it covers, not the lifetime total"
+            )
     busiest = payload.get("busiest_day")
     if busiest:
         lines.append(f"  busiest day {busiest['date']} with {_fmt(busiest['tokens'])} tokens")
@@ -621,14 +653,21 @@ def render_text(payload, source="(unknown)"):
 
     attribution = payload["attribution"]
     lines.append("ATTRIBUTION (the two lifetime views in the same file)")
-    lines.append(
-        f"  per-day view {_fmt(attribution['daily_total'])} - "
-        f"per-model view {_fmt(attribution['model_total'])} - "
-        f"gap {_fmt(attribution['gap'])} ({attribution['gap_share'] * 100:.2f}%)"
-    )
-    lines.append(
-        f"  {attribution['reconciled_models']} of {attribution['models_compared']} models reconcile"
-    )
+    if attribution["models_compared"]:
+        lines.append(
+            f"  per-day view {_fmt(attribution['daily_total'])} - "
+            f"per-model view {_fmt(attribution['model_total'])} - "
+            f"gap {_fmt(attribution['gap'])} ({attribution['gap_share'] * 100:.2f}%)"
+        )
+        lines.append(
+            f"  {attribution['reconciled_models']} of {attribution['models_compared']} "
+            "models reconcile"
+        )
+    else:
+        lines.append(
+            "  not comparable - the receipt carries no modelUsage entries, so there is "
+            "only one view here; nothing can be said about a gap"
+        )
     for gap in attribution["gaps"]:
         lines.append(
             f"    {gap['model']:<26} daily {_fmt(gap['daily']):>12}  "
@@ -638,20 +677,31 @@ def render_text(payload, source="(unknown)"):
 
     coverage = payload["coverage"]
     lines.append("COVERAGE")
-    lines.append(
-        f"  activity {coverage['activity_days']} days "
-        f"({coverage['activity_first']} .. {coverage['activity_last']}) - "
-        f"token records {coverage['token_days']} days "
-        f"({coverage['tokens_first']} .. {coverage['tokens_last']})"
-    )
-    missing = coverage["activity_without_tokens"]
-    if missing:
+    if coverage["activity_days"] or coverage["token_days"]:
         lines.append(
-            f"  {len(missing)} day(s) with messages but no token record: {', '.join(missing)}"
+            f"  activity {coverage['activity_days']} days "
+            f"({_range(coverage['activity_first'], coverage['activity_last'])}) - "
+            f"token records {coverage['token_days']} days "
+            f"({_range(coverage['tokens_first'], coverage['tokens_last'])})"
         )
+        missing = coverage["activity_without_tokens"]
+        if missing:
+            lines.append(
+                f"  {len(missing)} day(s) with messages but no token record: "
+                f"{', '.join(missing)}"
+            )
+        elif coverage["activity_days"]:
+            lines.append("  every activity day has a token record")
     else:
-        lines.append("  every activity day has a token record")
+        lines.append("  none recorded in this receipt - there is no day to reconcile")
     return "\n".join(lines) + "\n"
+
+
+def _range(first, last):
+    """A date range, or 'none' - never the word None in a reader-facing line."""
+    if first is None and last is None:
+        return "none"
+    return f"{first} .. {last}"
 
 
 KNOWN_KEYS = ("dailyActivity", "dailyModelTokens", "modelUsage")
