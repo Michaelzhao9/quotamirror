@@ -274,7 +274,37 @@ def audit_units(cache):
                         "verdict": "all_zero",
                     }
                 )
-    return {"zeros": zeros, "series": _series(cache), "percents": _percent_audit(cache)}
+    audit = {
+        "zeros": zeros,
+        "series": _series(cache),
+        "percents": _percent_audit(cache),
+        "capacity": {
+            "models": len([e for e in models.values() if isinstance(e, dict)]),
+            "audited": bool(_any_tokens(models)),
+        },
+    }
+    return audit
+
+
+def _capacity_absence(payload):
+    """The sentence for the case where no zero field was found.
+
+    It must name the population it was taken over: 'nothing is wrong' over zero
+    models is not an all-clear, it is a claim about a file nobody read.
+    """
+    capacity = payload.get("capacity") or {}
+    models = capacity.get("models", 0)
+    if models == 0:
+        return (
+            "0 modelUsage entries in this receipt - no capacity field can be audited, "
+            "and none is claimed to be absent"
+        )
+    if not capacity.get("audited", True):
+        return (
+            f"{models} model(s) carry no tokens, so a zero capacity cannot be told apart "
+            "from an unreported one - not audited"
+        )
+    return f"none of {models} model(s) has a field that is zero on every model"
 
 
 def render_units(payload):
@@ -282,7 +312,7 @@ def render_units(payload):
     lines.append("CAPACITY (a field that is present where zero is not a possible value)")
     zeros = payload.get("zeros") or []
     if not zeros:
-        lines.append("  no capacity field is zero for every model")
+        lines.append(f"  {_capacity_absence(payload)}")
     for row in zeros:
         lines.append(
             f"  {row['field']:<24} {row['zeros']} of {row['present']} present values are zero "
@@ -1364,19 +1394,32 @@ def _signed(value):
     return f"+{value:,}" if value > 0 else f"{value:,}"
 
 
+def _date_reading(value):
+    """A date that is absent from the receipt is named, not printed as None."""
+    return value if value else "not recorded in this receipt"
+
+
 def render_revise(payload, recorded=True):
     lines = ["RECEIPT REVISIONS (the same keys, read twice)"]
     lines.append(f"  source:   {payload['source']}")
     lines.append(
         f"  receipt:  version {payload['version_key']}, "
-        f"lastComputedDate {payload['last_computed']}"
+        f"lastComputedDate: {_date_reading(payload['last_computed'])}"
     )
     lines.append("")
     if not payload["measurable"]:
         lines.append("  this is the first reading of these keys: there is no earlier reading")
         lines.append("  in the store, so nothing can be compared yet.")
         lines.append(f"  recorded: {payload['keys_now']} keys.")
-        if recorded:
+        if payload["keys_now"] == 0:
+            lines.append("")
+            lines.append(
+                "  this receipt carries no monotone token counter, so there is no key a"
+            )
+            lines.append(
+                "  second reading could revise: read again and it will still be 0 keys."
+            )
+        elif recorded:
             lines.append(
                 "  run `quotamirror revise` again later - the second reading is what makes"
             )
@@ -1389,11 +1432,11 @@ def render_revise(payload, recorded=True):
 
     lines.append(
         f"  earlier:  {payload['baseline_at']}  version {payload['baseline_version_key']}, "
-        f"lastComputedDate {payload['baseline_last_computed']}"
+        f"lastComputedDate: {_date_reading(payload['baseline_last_computed'])}"
     )
     lines.append(
         f"  now:      version {payload['version_key']}, "
-        f"lastComputedDate {payload['last_computed']}"
+        f"lastComputedDate: {_date_reading(payload['last_computed'])}"
     )
     lines.append("")
     lines.append(f"  {'key'.ljust(44)} {'earlier':>14} {'now':>14} {'delta':>14}")
@@ -1406,11 +1449,17 @@ def render_revise(payload, recorded=True):
             f"{_signed(row['delta']):>14}{mark}"
         )
     lines.append("")
-    lines.append(
-        f"  keys compared: {payload['compared']} of {payload['keys_earlier']} earlier / "
-        f"{payload['keys_now']} now; {payload['down']} down, {payload['up']} up, "
-        f"{payload['flat']} unchanged; net {_signed(payload['net_delta'])} tokens."
-    )
+    if payload["compared"] == 0:
+        lines.append(
+            f"  keys compared: 0 of {payload['keys_earlier']} earlier / "
+            f"{payload['keys_now']} now; net: nothing to sum - no key is present in both readings."
+        )
+    else:
+        lines.append(
+            f"  keys compared: {payload['compared']} of {payload['keys_earlier']} earlier / "
+            f"{payload['keys_now']} now; {payload['down']} down, {payload['up']} up, "
+            f"{payload['flat']} unchanged; net {_signed(payload['net_delta'])} tokens."
+        )
     if payload["appeared"]:
         lines.append(
             f"  appeared in this reading only ({len(payload['appeared'])}): "

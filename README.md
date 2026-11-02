@@ -59,6 +59,12 @@ python3 quotamirror.py units --json
 
 Checks zero capacities, series units inferred by exact arithmetic, suspicious percent scales, monotone cumulative counters, and fine-grained versus coarse totals.
 
+The capacity all-clear states how many models it audited, and changes its sentence when
+there were none: `0 modelUsage entries in this receipt - no capacity field can be audited,
+and none is claimed to be absent`. An all-clear over zero models is a claim about a file
+nobody read; models present with no tokens read `not audited`, because a zero capacity and
+an unreported one look identical there.
+
 ### `loop` — repeated tool calls
 
 ```bash
@@ -93,6 +99,12 @@ A receipt describes the present, but it is not immutable. The same key read twic
 Only the downward direction needs no further explanation: a monotone counter cannot un-spend tokens, so a key that reads lower was **revised**, and the report says so instead of calling it less usage. An upward change may be new work or a late write onto an older day, and two readings cannot tell those apart. A key present in only one reading is never counted as zero — it is reported as appeared or absent. A day that the earlier receipt had already declared computed is flagged `closed`, because a change there is the entry being rewritten rather than work landing on it.
 
 The first run prints a first reading and records it; the second is what makes a revision visible. The store keeps the newest five readings per receipt under a SHA-256 digest of the receipt's path, atomically replaced with mode `0600` (a symlink destination is refused). It holds token numbers and model IDs — not paths, prompts, or transcript text.
+
+Two cases print a refusal instead of a number. A receipt with no monotone token counter
+records `0 keys` and says so — read again and it will still be 0 keys, so no revision can
+ever be stated from that pair. And when no key is present in both readings, the net line
+reads `net: nothing to sum` rather than `net +0 tokens`: a sum over nothing is not a total.
+An absent `lastComputedDate` prints `not recorded in this receipt` instead of `None`.
 
 ### `compare` — cross-harness accounting
 

@@ -152,7 +152,9 @@ def test_render_units_is_explicit_when_nothing_is_wrong():
         quotamirror.audit_units(build_cache(models={"m-a": usage(tokens=1, contextWindow=200000)}))
     )
 
-    assert "no capacity field is zero for every model" in text
+    # the all-clear must name the population it audited (r71: it used to fire over
+    # zero models, where 'nothing is wrong' is a claim about an unread file)
+    assert "none of 1 model(s) has a field that is zero on every model" in text
     assert "no percent-named field" in text
 
 
