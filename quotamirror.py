@@ -2040,9 +2040,10 @@ def _claude_window_pair(claude_days, cache_window, claude_transcripts):
         }
     transcript_days = set(scan["day_totals"])
     cache_days = set(claude_days)
-    only_transcript = sorted(transcript_days - cache_days)
-    only_cache = sorted(cache_days - transcript_days)
-    both = sorted(transcript_days & cache_days)
+    table = _table_overlap(transcript_days, cache_days, "transcript", "cache table")
+    only_transcript = table["days_left_only"]
+    only_cache = table["days_right_only"]
+    both = table["days_both"]
     tokens_only_transcript = sum(scan["day_totals"][day] for day in only_transcript)
     total = scan["tokens"]
     transcript_shared = sum(scan["day_totals"][day] for day in both)
@@ -2073,6 +2074,8 @@ def _claude_window_pair(claude_days, cache_window, claude_transcripts):
         "days_transcript_only": only_transcript,
         "days_cache_only": only_cache,
         "days_both": both,
+        "coverage": table["coverage"],
+        "note": table["note"],
         "tokens_transcript_only": tokens_only_transcript,
         "pct_transcript_only": (
             round(100 * tokens_only_transcript / total, 1) if total else None
@@ -2087,25 +2090,27 @@ def _claude_window_pair(claude_days, cache_window, claude_transcripts):
     }
 
 
-def day_overlap(codex_days, claude_days):
+def _table_overlap(left_days, right_days, left_label, right_label):
     """Two day tables and the days they share -- plus why a zero is zero.
 
     A bare `in both: 0` reads as a measurement, but on a machine whose two
-    harnesses cover disjoint calendar windows it is arithmetic: no shared day
-    was ever possible. Name the case instead of printing the placeholder.
+    windows are disjoint calendar ranges it is arithmetic: no shared day was
+    ever possible. Name the case instead of printing the placeholder. The two
+    callers (the two harnesses, and Claude's two counters) differ only in the
+    labels, so they share one rule rather than two drifting copies of it.
     """
-    codex = sorted(set(codex_days))
-    claude = sorted(set(claude_days))
-    both = sorted(set(codex) & set(claude))
+    left = sorted(set(left_days))
+    right = sorted(set(right_days))
+    both = sorted(set(left) & set(right))
     result = {
         "days_both": both,
-        "days_codex_only": sorted(set(codex) - set(claude)),
-        "days_claude_only": sorted(set(claude) - set(codex)),
+        "days_left_only": sorted(set(left) - set(right)),
+        "days_right_only": sorted(set(right) - set(left)),
         "coverage": "shared_days",
         "note": "",
     }
-    if not codex or not claude:
-        missing = "codex" if not codex else "claude"
+    if not left or not right:
+        missing = left_label if not left else right_label
         result["coverage"] = "no_days"
         result["note"] = (
             f"{missing} produced no day at all, so there is no day table to overlap "
@@ -2114,18 +2119,23 @@ def day_overlap(codex_days, claude_days):
         return result
     if both:
         return result
-    if codex[-1] < claude[0] or claude[-1] < codex[0]:
+    windows = f"({left_label} {left[0]}..{left[-1]}, {right_label} {right[0]}..{right[-1]})"
+    if left[-1] < right[0] or right[-1] < left[0]:
         result["coverage"] = "disjoint_windows"
-        result["note"] = (
-            f"no day can be in both: the two windows do not intersect "
-            f"(codex {codex[0]}..{codex[-1]}, claude {claude[0]}..{claude[-1]})"
-        )
+        result["note"] = f"no day can be in both: the two windows do not intersect {windows}"
         return result
     result["coverage"] = "no_shared_day"
     result["note"] = (
-        f"the two windows intersect (codex {codex[0]}..{codex[-1]}, "
-        f"claude {claude[0]}..{claude[-1]}) but no calendar day carries usage in both tables"
+        f"the two windows intersect {windows} but no calendar day carries usage in both tables"
     )
+    return result
+
+
+def day_overlap(codex_days, claude_days):
+    """The two harnesses' day tables: shared days, one-sided days, and why."""
+    result = _table_overlap(codex_days, claude_days, "codex", "claude")
+    result["days_codex_only"] = result.pop("days_left_only")
+    result["days_claude_only"] = result.pop("days_right_only")
     return result
 
 
@@ -2454,8 +2464,14 @@ def render_compare(payload):
                      f"  [{_stamp_text(stamps['claude.transcripts'])}]")
         lines.append(_observation_line(pair["observation"]))
         lines.append(f"  cache table  : {_window_text(pair['cache'])}  [{_stamp_text(stamps['claude.daily'])}]")
-        lines.append(f"  days in both : {len(pair['days_both'])}"
-                     f" | transcript only: {len(pair['days_transcript_only'])}"
+        if pair["coverage"] == "no_days":
+            lines.append(f"  days in both : not measured -- {pair['note']}")
+        else:
+            both_line = f"  days in both : {len(pair['days_both'])}"
+            if pair["note"]:
+                both_line += f" -- {pair['note']}"
+            lines.append(both_line)
+        lines.append(f"    transcript only: {len(pair['days_transcript_only'])}"
                      f" | cache only: {len(pair['days_cache_only'])}")
         if pair["days_transcript_only"]:
             only = pair["days_transcript_only"]

@@ -183,7 +183,7 @@ The expected result is not a guessed bill. It is a receipt stating that the pric
 5. **A total declares accounting.** Delta and cumulative values are never blended.
 6. **Windows must match.** Different date ranges are compared as coverage, not bills.
 7. **No evidence means no verdict.** Missing transcripts or baselines produce unavailable/no-baseline states.
-8. **A zero declares which zero it is.** `store_empty`, `no_usage_records` and `usage_observed` are separate states, and a coverage sentence is not printed about records that were never read. The day overlap obeys the same rule: `shared_days`, `disjoint_windows` and `no_shared_day` are different statements, so `in both : 0` carries the reason it cannot be anything else.
+8. **A zero declares which zero it is.** `store_empty`, `no_usage_records` and `usage_observed` are separate states, and a coverage sentence is not printed about records that were never read. Every overlap obeys the same rule — the two harnesses' day tables and Claude's two counters alike: `shared_days`, `disjoint_windows` and `no_shared_day` are different statements, so `in both : 0` carries the reason it cannot be anything else.
 9. **Read-only toward harnesses.** The tool never changes vendor caches or transcripts.
 10. **A decrease is a revision, not less usage.** A monotone counter read twice can only read lower if the record was rewritten.
 
