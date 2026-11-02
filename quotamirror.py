@@ -3463,10 +3463,14 @@ def main(argv=None):
         Path.home() / ".claude" / "stats-cache.json",
         "the receipt whose field set is diffed",
     )
+    drift_shapes = Path.home() / ".cache" / "quotamirror" / "shapes.json"
     drift.add_argument(
         "--store",
-        default=str(Path.home() / ".cache" / "quotamirror" / "shapes.json"),
-        help="where field-set snapshots are kept (paths and type names only)",
+        default=str(drift_shapes),
+        help=(
+            "where field-set snapshots are kept, one per receipt version (paths and type names "
+            f"only; default {_tilde(drift_shapes)})"
+        ),
     )
     drift.add_argument("--json", action="store_true", help="machine-readable payload")
     drift.add_argument(
@@ -3487,7 +3491,10 @@ def main(argv=None):
     revise.add_argument(
         "--store",
         default=str(READING_STORE_DEFAULT),
-        help="where earlier readings are kept (token numbers under a path digest, mode 0600)",
+        help=(
+            "where earlier readings are kept, newest 5 per receipt (token numbers under a path "
+            f"digest, mode 0600; default {_tilde(READING_STORE_DEFAULT)})"
+        ),
     )
     revise.add_argument("--json", action="store_true", help="machine-readable payload")
     revise.add_argument(
@@ -3499,15 +3506,30 @@ def main(argv=None):
             "totals split by scope, each stamped includes_descendants + accounting + a measured "
             "window (Claude transcripts)"
         ),
+        add_help=False,
     )
+    nested_input = nested.add_argument_group(
+        "input",
+        "the transcript directory and how much of it is read",
+    )
+    nested_measure = nested.add_argument_group(
+        "measurement",
+        "an optional receipt placed beside this command's own measured window",
+    )
+    nested_thresholds = nested.add_argument_group(
+        "day cross-check",
+        "the two numbers that decide a day's verdict",
+    )
+    nested_output = nested.add_argument_group("output", "what the command prints")
+    nested_general = nested.add_argument_group("options")
+    nested_general.add_argument("-h", "--help", action="help", help="show this help message and exit")
     _add_path_arg(
-        nested,
+        nested_input,
         Path.home() / ".claude" / "projects",
         "the transcript directory to measure",
     )
-    nested.add_argument("--json", action="store_true", help="machine-readable payload")
-    nested.add_argument("--max-files", type=int, default=None, help="only the newest N transcripts")
-    nested.add_argument(
+    nested_input.add_argument("--max-files", type=int, default=None, help="only the newest N transcripts")
+    nested_measure.add_argument(
         "--cache",
         default=None,
         help=(
@@ -3515,7 +3537,8 @@ def main(argv=None):
             "window; omit and only one of the two windows is known"
         ),
     )
-    _add_floor_args(nested)
+    _add_floor_args(nested_thresholds)
+    nested_output.add_argument("--json", action="store_true", help="machine-readable payload")
     compare = sub.add_parser(
         "compare",
         help=(

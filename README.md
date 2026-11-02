@@ -83,7 +83,7 @@ python3 quotamirror.py drift --no-record
 python3 quotamirror.py drift --store ./shapes.json --path ./fixture.json
 ```
 
-Stores a format-version marker plus a normalized schema: dotted field paths and type names grouped by declared receipt version. Model dictionary keys are replaced with `<model>`, date-shaped dictionary keys with `<date>`, and the receipt is identified by a SHA-256 digest of its canonical path rather than by the path itself. Capture timestamps, counters, receipt values, and model names are not stored. The store is atomically replaced with mode `0600`; a symlink destination is refused. On the next recording, a legacy schema-1 store is replaced rather than migrated because its keys may contain the private data this format removes.
+Stores a format-version marker plus a normalized schema: dotted field paths and type names grouped by declared receipt version. Model dictionary keys are replaced with `<model>`, date-shaped dictionary keys with `<date>`, and the receipt is identified by a SHA-256 digest of its canonical path rather than by the path itself. Capture timestamps, counters, receipt values, and model names are not stored. The store is atomically replaced with mode `0600`; a symlink destination is refused. Without `--store` it lives at `~/.cache/quotamirror/shapes.json`, one snapshot per receipt version. On the next recording, a legacy schema-1 store is replaced rather than migrated because its keys may contain the private data this format removes.
 
 ### `revise` — the same keys, read twice
 
@@ -98,7 +98,7 @@ A receipt describes the present, but it is not immutable. The same key read twic
 
 Only the downward direction needs no further explanation: a monotone counter cannot un-spend tokens, so a key that reads lower was **revised**, and the report says so instead of calling it less usage. An upward change may be new work or a late write onto an older day, and two readings cannot tell those apart. A key present in only one reading is never counted as zero — it is reported as appeared or absent. A day that the earlier receipt had already declared computed is flagged `closed`, because a change there is the entry being rewritten rather than work landing on it.
 
-The first run prints a first reading and records it; the second is what makes a revision visible. The store keeps the newest five readings per receipt under a SHA-256 digest of the receipt's path, atomically replaced with mode `0600` (a symlink destination is refused). It holds token numbers and model IDs — not paths, prompts, or transcript text.
+The first run prints a first reading and records it; the second is what makes a revision visible. The store keeps the newest five readings per receipt under a SHA-256 digest of the receipt's path, atomically replaced with mode `0600` (a symlink destination is refused). It holds token numbers and model IDs — not paths, prompts, or transcript text. Without `--store` it lives at `~/.cache/quotamirror/readings.json`; both commands print that default in `--help`, because a file the tool writes and does not name is a file the user has to find in the source.
 
 Two cases print a refusal instead of a number. A receipt with no monotone token counter
 records `0 keys` and says so — read again and it will still be 0 keys, so no revision can
