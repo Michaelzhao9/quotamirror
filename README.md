@@ -154,6 +154,12 @@ Every run also prints an `observation` line, because a zero over a directory tha
 
 `store_empty` (nothing was there to read), `no_usage_records` (files were read and none carried a usage block) and `usage_observed` are three different facts, and only the last one supports a statement about usage.
 
+## Reading the help
+
+Every option says what it reads or writes and which default it uses. `--path` names the default for the command you are running, because the default is not the same everywhere: the receipt commands open `~/.claude/stats-cache.json`, while `loop` and `nested` open the transcripts under `~/.claude/projects`.
+
+`compare` prints its nine options under headings - `input`, `measurement`, `day cross-check`, `verdicts`, `output` - so a tolerance is not mistaken for an input directory in a flat list.
+
 ## Example receipt
 
 The repository examples and tests are synthetic. A deliberately inconsistent fixture may contain:
@@ -207,7 +213,7 @@ Individual commands may expose additional refusal states in their JSON payloads;
 uv run --with pytest pytest -q
 ```
 
-The suite covers receipt reconciliation, unit and cumulative checks, loop deduplication, schema drift, two-reading revisions, cross-harness witnesses, polling shares, nested scope, day-level cross-checks, arbitration between record-sum and message-id-merged totals, and that every command can format its own `--help`.
+The suite covers receipt reconciliation, unit and cumulative checks, loop deduplication, schema drift, two-reading revisions, cross-harness witnesses, polling shares, nested scope, day-level cross-checks, arbitration between record-sum and message-id-merged totals, that every command can format its own `--help`, and that every option carries a description naming its own default.
 
 ## Limitations
 

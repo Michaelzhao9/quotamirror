@@ -3044,6 +3044,24 @@ def _undecided_arbitration(floor, tol, reason):
     }
 
 
+def _tilde(path):
+    """Help text is copied into issues and screenshots; keep the home directory out of it."""
+    text = str(path)
+    home = str(Path.home())
+    return "~" + text[len(home):] if home and text.startswith(home) else text
+
+
+def _add_path_arg(parser, default, what):
+    """`--path` says which file it opens, and which one it opens when omitted.
+
+    The default is not the same for every command - the stats cache for the
+    receipt commands, the projects directory for the transcript commands - so a
+    bare `--path PATH` left the reader guessing which of the two they were about
+    to hand to the tool.
+    """
+    parser.add_argument("--path", default=str(default), help=f"{what} (default {_tilde(default)})")
+
+
 def _add_floor_args(parser):
     """The two numbers that decide a day's verdict, exposed so a reader can re-run it."""
     parser.add_argument(
@@ -3409,11 +3427,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="quotamirror")
     sub = parser.add_subparsers(dest="command", required=True)
     scan = sub.add_parser("scan", help="read a usage cache and print a receipt")
-    scan.add_argument("--path", default=str(Path.home() / ".claude" / "stats-cache.json"))
+    _add_path_arg(
+        scan,
+        Path.home() / ".claude" / "stats-cache.json",
+        "the usage cache to read",
+    )
     scan.add_argument("--json", action="store_true", help="machine-readable payload")
     scan.add_argument("--today", default=None, help="YYYY-MM-DD; enables staleness measurement")
     units = sub.add_parser("units", help="magnitude audit: zero capacities, inferred units, percent scales")
-    units.add_argument("--path", default=str(Path.home() / ".claude" / "stats-cache.json"))
+    _add_path_arg(
+        units,
+        Path.home() / ".claude" / "stats-cache.json",
+        "the usage cache whose fields are audited",
+    )
     units.add_argument("--json", action="store_true", help="machine-readable payload")
     units.add_argument(
         "--cumulative",
@@ -3421,14 +3447,22 @@ def main(argv=None):
         help="add the CUMULATIVE verdict: a running total summed as a daily increment",
     )
     loop = sub.add_parser("loop", help="repeat detection over session transcripts (arguments hashed, never printed)")
-    loop.add_argument("--path", default=str(Path.home() / ".claude" / "projects"))
+    _add_path_arg(
+        loop,
+        Path.home() / ".claude" / "projects",
+        "the transcript directory to scan",
+    )
     loop.add_argument("--json", action="store_true", help="machine-readable payload")
     loop.add_argument("--max-files", type=int, default=None, help="only the newest N transcripts")
     drift = sub.add_parser(
         "drift",
         help="receipt schema drift: diff this receipt's field set against the last other version recorded",
     )
-    drift.add_argument("--path", default=str(Path.home() / ".claude" / "stats-cache.json"))
+    _add_path_arg(
+        drift,
+        Path.home() / ".claude" / "stats-cache.json",
+        "the receipt whose field set is diffed",
+    )
     drift.add_argument(
         "--store",
         default=str(Path.home() / ".cache" / "quotamirror" / "shapes.json"),
@@ -3445,7 +3479,11 @@ def main(argv=None):
             "downward revision is not reported as less usage"
         ),
     )
-    revise.add_argument("--path", default=str(Path.home() / ".claude" / "stats-cache.json"))
+    _add_path_arg(
+        revise,
+        Path.home() / ".claude" / "stats-cache.json",
+        "the receipt whose counters are read twice",
+    )
     revise.add_argument(
         "--store",
         default=str(READING_STORE_DEFAULT),
@@ -3462,7 +3500,11 @@ def main(argv=None):
             "window (Claude transcripts)"
         ),
     )
-    nested.add_argument("--path", default=str(Path.home() / ".claude" / "projects"))
+    _add_path_arg(
+        nested,
+        Path.home() / ".claude" / "projects",
+        "the transcript directory to measure",
+    )
     nested.add_argument("--json", action="store_true", help="machine-readable payload")
     nested.add_argument("--max-files", type=int, default=None, help="only the newest N transcripts")
     nested.add_argument(
@@ -3480,16 +3522,41 @@ def main(argv=None):
             "two harnesses: every total stamped with includes_descendants + accounting + window, "
             "the three witnesses, and the day overlap"
         ),
+        add_help=False,
     )
-    compare.add_argument(
+    compare_input = compare.add_argument_group(
+        "input",
+        "the two receipts and how much of them is read",
+    )
+    compare_measure = compare.add_argument_group(
+        "measurement",
+        "an optional second witness placed beside the cache's declared day table",
+    )
+    compare_thresholds = compare.add_argument_group(
+        "day cross-check",
+        "the two numbers that decide a day's verdict",
+    )
+    compare_verdicts = compare.add_argument_group(
+        "verdicts",
+        "what is computed on top of the two totals",
+    )
+    compare_output = compare.add_argument_group("output", "what the command prints")
+    compare_general = compare.add_argument_group("options")
+    compare_general.add_argument("-h", "--help", action="help", help="show this help message and exit")
+    compare_input.add_argument(
         "--codex",
         default=str(Path.home() / ".codex" / "sessions"),
         help="rollout directory of the second harness (Codex CLI sessions)",
     )
-    compare.add_argument("--path", default=str(Path.home() / ".claude" / "stats-cache.json"))
-    compare.add_argument("--json", action="store_true", help="machine-readable payload")
-    compare.add_argument("--max-sessions", type=int, default=None, help="only the newest N rollouts")
-    compare.add_argument(
+    _add_path_arg(
+        compare_input,
+        Path.home() / ".claude" / "stats-cache.json",
+        "the claude-side receipt compared with those rollouts",
+    )
+    compare_input.add_argument(
+        "--max-sessions", type=int, default=None, help="only the newest N rollouts"
+    )
+    compare_measure.add_argument(
         "--claude-transcripts",
         default=None,
         help=(
@@ -3497,12 +3564,13 @@ def main(argv=None):
             "timestamps, so the cache's declared day table and the records are printed side by side"
         ),
     )
-    _add_floor_args(compare)
-    compare.add_argument(
+    _add_floor_args(compare_thresholds)
+    compare_verdicts.add_argument(
         "--poll-share",
         action="store_true",
         help="add COORDINATION SPEND: share of turns that only polled, always with its denominator",
     )
+    compare_output.add_argument("--json", action="store_true", help="machine-readable payload")
     args = parser.parse_args(argv)
     if args.command in {"nested", "compare"}:
         try:
