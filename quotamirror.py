@@ -2087,6 +2087,48 @@ def _claude_window_pair(claude_days, cache_window, claude_transcripts):
     }
 
 
+def day_overlap(codex_days, claude_days):
+    """Two day tables and the days they share -- plus why a zero is zero.
+
+    A bare `in both: 0` reads as a measurement, but on a machine whose two
+    harnesses cover disjoint calendar windows it is arithmetic: no shared day
+    was ever possible. Name the case instead of printing the placeholder.
+    """
+    codex = sorted(set(codex_days))
+    claude = sorted(set(claude_days))
+    both = sorted(set(codex) & set(claude))
+    result = {
+        "days_both": both,
+        "days_codex_only": sorted(set(codex) - set(claude)),
+        "days_claude_only": sorted(set(claude) - set(codex)),
+        "coverage": "shared_days",
+        "note": "",
+    }
+    if not codex or not claude:
+        missing = "codex" if not codex else "claude"
+        result["coverage"] = "no_days"
+        result["note"] = (
+            f"{missing} produced no day at all, so there is no day table to overlap "
+            f"(an empty table is not a count of zero shared days)"
+        )
+        return result
+    if both:
+        return result
+    if codex[-1] < claude[0] or claude[-1] < codex[0]:
+        result["coverage"] = "disjoint_windows"
+        result["note"] = (
+            f"no day can be in both: the two windows do not intersect "
+            f"(codex {codex[0]}..{codex[-1]}, claude {claude[0]}..{claude[-1]})"
+        )
+        return result
+    result["coverage"] = "no_shared_day"
+    result["note"] = (
+        f"the two windows intersect (codex {codex[0]}..{codex[-1]}, "
+        f"claude {claude[0]}..{claude[-1]}) but no calendar day carries usage in both tables"
+    )
+    return result
+
+
 def compare_harnesses(
     codex_root, claude_cache, max_sessions=None, claude_transcripts=None,
     min_tokens=None, tolerance=None,
@@ -2142,8 +2184,6 @@ def compare_harnesses(
                 f"table do not contain the same usage ({toward})"
             ),
         }
-    both = sorted(set(codex_days) & set(claude_days))
-
     subagent_threads = [
         s for s in sessions
         if s["thread"].get("thread_source") == "subagent" or s["thread"].get("parent_thread_id")
@@ -2303,11 +2343,7 @@ def compare_harnesses(
         "claude_window": {k: v for k, v in claude_window_pair.items() if k != "transcript_scan"},
         "claude_day_crosscheck": crosscheck,
         "comparability": comparability,
-        "overlap": {
-            "days_both": both,
-            "days_codex_only": sorted(set(codex_days) - set(claude_days)),
-            "days_claude_only": sorted(set(claude_days) - set(codex_days)),
-        },
+        "overlap": day_overlap(codex_days, claude_days),
         "unit_note": (
             "the two totals are not the same quantity: Codex counts total_tokens as "
             "input+output with cached input nested inside input, while the Claude cache "
@@ -2394,7 +2430,14 @@ def render_compare(payload):
     _render_crosscheck(payload["claude_day_crosscheck"], lines)
     lines.append("")
     lines.append("DAY OVERLAP")
-    lines.append(f"  in both     : {len(payload['overlap']['days_both'])}")
+    overlap = payload["overlap"]
+    if overlap["coverage"] == "no_days":
+        lines.append(f"  in both     : not measured -- {overlap['note']}")
+    else:
+        both_line = f"  in both     : {len(overlap['days_both'])}"
+        if overlap["note"]:
+            both_line += f" -- {overlap['note']}"
+        lines.append(both_line)
     lines.append(f"  codex only  : {len(payload['overlap']['days_codex_only'])}"
                  + (f" ({', '.join(payload['overlap']['days_codex_only'][:6])})" if payload['overlap']['days_codex_only'] else ""))
     lines.append(f"  claude only : {len(payload['overlap']['days_claude_only'])}"
