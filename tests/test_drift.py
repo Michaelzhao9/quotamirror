@@ -97,7 +97,7 @@ def test_shape_drops_values_even_when_they_are_nested_strings():
 
 def test_missing_store_reads_as_empty(tmp_path):
     store = quotamirror.load_store(tmp_path / "shapes.json")
-    assert store["schema"] == 2
+    assert store["schema"] == quotamirror.STORE_SCHEMA
     assert store["caches"] == {}
 
 
@@ -116,7 +116,7 @@ def test_record_keeps_only_normalized_shape_under_a_path_digest(tmp_path):
     assert list(store["caches"]) == [quotamirror.path_identity(path)]
     entry = store["caches"][quotamirror.path_identity(path)]["versions"]["5/5"]
     assert entry["shape"] == quotamirror.shape_of(receipt(note=SENTINEL))
-    assert set(entry) == {"shape", "at"}
+    assert set(entry) == {"shape", "presence", "at"}
     assert "modelUsage.<model>.inputTokens" in entry["shape"]
 
 
@@ -132,7 +132,7 @@ def test_record_keeps_the_shape_and_no_value(tmp_path):
     store = quotamirror.load_store(store_file)
     entry = store["caches"][quotamirror.path_identity(path)]["versions"]["5/5"]
     assert entry["shape"] == quotamirror.shape_of(receipt(note=SENTINEL))
-    assert set(entry) == {"shape", "at"}
+    assert set(entry) == {"shape", "presence", "at"}
 
 
 def test_recording_the_same_version_twice_updates_one_entry(tmp_path):
@@ -162,7 +162,7 @@ def test_existing_store_is_replaced_atomically(tmp_path):
     quotamirror.record_shape(store_file, path, receipt(version=6, dailyModelTokensVersion=6))
 
     assert store_file.stat().st_ino != old_inode
-    assert json.loads(store_file.read_text(encoding="utf-8"))["schema"] == 2
+    assert json.loads(store_file.read_text(encoding="utf-8"))["schema"] == quotamirror.STORE_SCHEMA
 
 
 def test_existing_store_is_corrected_to_private_mode(tmp_path):
@@ -216,7 +216,7 @@ def test_two_version_fields_that_disagree_are_reported_without_stored_state(tmp_
     )
     store = quotamirror.load_store(store_file)
     entry = store["caches"][quotamirror.path_identity(path)]["versions"]["5/4"]
-    assert set(entry) == {"shape", "at"}
+    assert set(entry) == {"shape", "presence", "at"}
     assert quotamirror.drift_report(store, path, receipt(version=5, dailyModelTokensVersion=4))["version_fields_disagree"] is True
 
 
@@ -510,7 +510,11 @@ def test_the_recorded_shape_carries_when_it_was_seen(tmp_path):
     quotamirror.record_shape(store_file, path, receipt(), captured_at="2026-11-01T00:00:00Z")
 
     entry = quotamirror.load_store(store_file)["caches"][quotamirror.path_identity(path)]["versions"]["5/5"]
-    assert entry == {"shape": quotamirror.shape_of(receipt()), "at": "2026-11-01T00:00:00Z"}
+    assert entry == {
+        "shape": quotamirror.shape_of(receipt()),
+        "presence": quotamirror.shape_presence(receipt()),
+        "at": "2026-11-01T00:00:00Z",
+    }
 
 
 def test_a_within_version_change_is_visible_against_the_store_written_before_it(tmp_path):
@@ -564,7 +568,10 @@ def test_a_store_written_before_timestamps_existed_is_still_comparable(tmp_path)
 
     within = _within(payload)
     assert within["measurable"] is True
-    assert within["verdict"] == "unchanged"
+    # the shape axis is comparable, but this entry predates presence counts, so
+    # "unchanged" would be an all-clear over an axis nobody recorded
+    assert within["verdict"] == "unchanged_shape_only"
+    assert within["presence_compared"] is False
     assert within["baseline_at"] is None
 
 

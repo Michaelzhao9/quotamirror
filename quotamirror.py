@@ -988,26 +988,66 @@ def _type_name(value):
     return type(value).__name__
 
 
-def shape_of(receipt, prefix=""):
-    """Map every path in a receipt to its type name. Values are never kept."""
-    shape = {}
-    if isinstance(receipt, dict):
-        for key, value in receipt.items():
-            parent = prefix.rstrip(".").rsplit(".", 1)[-1].rstrip("[]")
+def _shape_walk(node, prefix=""):
+    """Walk a receipt into (shape, presence).
+
+    `shape` maps every path to a type name. `presence` maps a path whose key was
+    collapsed into `<model>` or `<date>` to [carried, family_size]: how many
+    members of that family carry it. A priced field that one of nine models kept
+    is [1, 9], and that is precisely the fact a bare "present" was hiding.
+    """
+    shape, presence = {}, {}
+    if isinstance(node, dict):
+        parent = prefix.rstrip(".").rsplit(".", 1)[-1].rstrip("[]")
+        groups = {}
+        for key, value in node.items():
             if parent in _MODEL_KEYED_FIELDS:
                 segment = "<model>"
             else:
                 segment = "<date>" if _DATE_KEY.match(str(key)) else str(key)
+            groups.setdefault(segment, []).append(value)
+
+        for segment, members in groups.items():
             child = f"{prefix}{segment}"
-            shape[child] = _type_name(value)
-            shape.update(shape_of(value, prefix=f"{child}."))
-    elif isinstance(receipt, list):
-        for item in receipt:
-            shape.update(shape_of(item, prefix=f"{prefix[:-1]}[]."))
-    return shape
+            member_shapes = []
+            owned_deeper = set()
+            for value in members:
+                member_shape, member_presence = _shape_walk(value, f"{child}.")
+                member_shapes.append(member_shape)
+                owned_deeper.update(member_presence)
+                shape.update(member_shape)
+                for path, counts in member_presence.items():
+                    total = presence.setdefault(path, [0, 0])
+                    total[0] += counts[0]
+                    total[1] += counts[1]
+            shape[child] = _type_name(members[-1])
+            if segment in ("<model>", "<date>") and len(members) > 1:
+                every_path = {path for member in member_shapes for path in member}
+                for path in every_path - owned_deeper:
+                    carried = sum(1 for member in member_shapes if path in member)
+                    presence[path] = [carried, len(members)]
+    elif isinstance(node, list):
+        for item in node:
+            member_shape, member_presence = _shape_walk(item, prefix=f"{prefix[:-1]}[].")
+            shape.update(member_shape)
+            for path, counts in member_presence.items():
+                total = presence.setdefault(path, [0, 0])
+                total[0] += counts[0]
+                total[1] += counts[1]
+    return shape, presence
 
 
-STORE_SCHEMA = 2
+def shape_of(receipt, prefix=""):
+    """Map every path in a receipt to its type name. Values are never kept."""
+    return _shape_walk(receipt, prefix)[0]
+
+
+def shape_presence(receipt):
+    """path -> [carried, family_size] inside the collapsed model/date families."""
+    return _shape_walk(receipt, "")[1]
+
+
+STORE_SCHEMA = 3
 
 
 def path_identity(path):
@@ -1039,23 +1079,34 @@ def _utc_stamp():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def record_shape(store_path, cache_path, receipt, captured_at=None):
-    """Persist a receipt's shape under its declared version. Values never reach disk.
+def _migrate_store(store):
+    """Upgrade a shape store in place. Entries that predate presence are kept.
 
-    The entry carries the shape *and* when it was seen, because the useful
-    comparison is not shape-against-itself: `drift` reads the store before it
-    writes, so what sits here is the baseline this run is diffed against.
+    Wiping a baseline to gain a field would delete the only copy of the shape a
+    future version has to be compared against; a baseline without presence is
+    still a valid shape baseline, it just cannot answer the newer question.
+    """
+    if store.get("schema") not in (2, STORE_SCHEMA):
+        return {"schema": STORE_SCHEMA, "caches": {}}
+    store["schema"] = STORE_SCHEMA
+    return store
+
+
+def record_shape(store_path, cache_path, receipt, captured_at=None):
+    """Persist a receipt's shape and per-family presence under its declared version.
+
+    Values never reach disk - only paths, type names, and how many models (or
+    days) carried each path, which is a count, not a value.
     """
     if store_path.is_symlink():
         raise ValueError(f"refusing symlink shape store: {store_path}")
-    store = load_store(store_path)
-    if store.get("schema") != STORE_SCHEMA:
-        store = {"schema": STORE_SCHEMA, "caches": {}}
+    store = _migrate_store(load_store(store_path))
     key, _ = _version_of(receipt)
     versions = store["caches"].setdefault(path_identity(cache_path), {}).setdefault("versions", {})
     versions.pop(key, None)
     versions[key] = {
         "shape": shape_of(receipt),
+        "presence": shape_presence(receipt),
         "at": captured_at or _utc_stamp(),
     }
 
@@ -1098,7 +1149,39 @@ def _is_meter_path(path):
     return any(word in leaf for word in METER_WORDS)
 
 
-def _shape_diff(base, current):
+def _family_noun(segment):
+    return "model(s)" if segment == "<model>" else "day(s)"
+
+
+def _narrowed_rows(base, current, base_presence, current_presence):
+    """Fields still present, but on fewer family members than the baseline had.
+
+    A family that shrank on its own - a model left the receipt entirely - is not
+    a narrowing: every field loses exactly one carrier at once, and calling that
+    "9 fields narrowed" would drown the one case this is for. So a row only
+    counts when the family is still at least as large as the old carrier count.
+    """
+    if not base_presence or not current_presence:
+        return []
+    rows = []
+    for path in sorted(set(base) & set(current)):
+        was = base_presence.get(path)
+        now = current_presence.get(path)
+        if not was or not now:
+            continue
+        if now[0] < was[0] and now[1] >= was[0]:
+            rows.append(
+                {
+                    "path": path,
+                    "family": "<model>" if "<model>" in path else "<date>",
+                    "was": list(was),
+                    "now": list(now),
+                }
+            )
+    return rows
+
+
+def _shape_diff(base, current, base_presence=None, current_presence=None, presence_compared=False):
     """What changed between two shapes. Used by both drift axes."""
     removed = sorted(set(base) - set(current))
     added = sorted(set(current) - set(base))
@@ -1109,12 +1192,23 @@ def _shape_diff(base, current):
     ]
     meter_removed = [path for path in removed if _is_meter_path(path)]
     meter_altered = [row["path"] for row in type_changed if _is_meter_path(row["path"])]
+    narrowed = _narrowed_rows(base, current, base_presence, current_presence)
+    meter_narrowed = [row["path"] for row in narrowed if _is_meter_path(row["path"])]
     if meter_removed:
         verdict = "meter_field_removed"
     elif meter_altered:
         verdict = "meter_field_altered"
+    elif meter_narrowed:
+        verdict = "meter_field_narrowed"
+    elif narrowed:
+        verdict = "field_narrowed"
     elif removed or added or type_changed:
         verdict = "schema_changed"
+    elif not presence_compared:
+        # the shape axis is clean, but the axis that catches a per-model removal
+        # was never recorded for this baseline - an all-clear here would be a
+        # claim about a measurement nobody made
+        verdict = "unchanged_shape_only"
     else:
         verdict = "unchanged"
     return {
@@ -1124,6 +1218,9 @@ def _shape_diff(base, current):
         "type_changed": type_changed,
         "meter_fields_removed": meter_removed,
         "meter_fields_altered": meter_altered,
+        "narrowed": narrowed,
+        "meter_fields_narrowed": meter_narrowed,
+        "presence_compared": presence_compared,
     }
 
 
@@ -1135,7 +1232,7 @@ WITHIN_REASONS = {
 }
 
 
-def within_version_report(versions, current, current_key):
+def within_version_report(versions, current, current_key, current_presence=None):
     """This version against the last shape recorded at the same version.
 
     Fed the store as it is *before* this run records, so `entry["shape"]` is the
@@ -1154,12 +1251,22 @@ def within_version_report(versions, current, current_key):
         "type_changed": [],
         "meter_fields_removed": [],
         "meter_fields_altered": [],
+        "narrowed": [],
+        "meter_fields_narrowed": [],
+        "presence_compared": False,
         "same_as_recorded_at": None,
     }
     base = entry.get("shape")
     if not base:
         return payload
-    diff = _shape_diff(base, current)
+    base_presence = entry.get("presence")
+    diff = _shape_diff(
+        base,
+        current,
+        base_presence,
+        current_presence,
+        presence_compared=base_presence is not None and current_presence is not None,
+    )
     payload.update(diff)
     payload.update(
         {
@@ -1184,6 +1291,7 @@ def drift_report(store, cache_path, receipt):
         versions = caches.get(str(cache_path), {}).get("versions", {})
     current_key, disagree = _version_of(receipt)
     current = shape_of(receipt)
+    current_presence = shape_presence(receipt)
     others = {k: v for k, v in versions.items() if k != current_key}
     payload = {
         "source": str(cache_path),
@@ -1200,15 +1308,27 @@ def drift_report(store, cache_path, receipt):
         "type_changed": [],
         "meter_fields_removed": [],
         "meter_fields_altered": [],
+        "narrowed": [],
+        "meter_fields_narrowed": [],
+        "presence_compared": False,
     }
-    payload["within_version"] = within_version_report(versions, current, current_key)
+    payload["within_version"] = within_version_report(
+        versions, current, current_key, current_presence
+    )
     if not others:
         return payload
 
     baseline_key = next(reversed(others))
     baseline = others[baseline_key]
-    diff = _shape_diff(baseline.get("shape") or {}, current)
     base = baseline.get("shape") or {}
+    base_presence = baseline.get("presence")
+    diff = _shape_diff(
+        base,
+        current,
+        base_presence,
+        current_presence,
+        presence_compared=base_presence is not None and current_presence is not None,
+    )
     removed = diff["removed"]
     added = diff["added"]
     type_changed = diff["type_changed"]
@@ -1226,6 +1346,9 @@ def drift_report(store, cache_path, receipt):
             "type_changed": type_changed,
             "meter_fields_removed": meter_removed,
             "meter_fields_altered": meter_altered,
+            "narrowed": diff["narrowed"],
+            "meter_fields_narrowed": diff["meter_fields_narrowed"],
+            "presence_compared": diff["presence_compared"],
             "fields_baseline": len(base),
         }
     )
@@ -1277,11 +1400,30 @@ def render_drift(payload):
             lines.append(
                 "  opencode 2.2.0 shape: no spend at all for a session that was billed."
             )
+        if payload["meter_fields_narrowed"]:
+            lines.append(
+                "  A field that carries a price is still in the receipt, just not on every model:"
+            )
+            lines.append(
+                "  a meter that sums across models now undercounts by the ones that lost it,"
+            )
+            lines.append("  and nothing in the payload says so.")
         if payload["meter_fields_altered"]:
             lines.append("  A field that carries a price changed type:")
             for row in payload["type_changed"]:
                 if row["path"] in payload["meter_fields_altered"]:
                     lines.append(f"    {row['path']}: {row['was']} -> {row['now']}")
+        if payload["narrowed"]:
+            lines.append("")
+            lines.append(
+                f"NARROWED ({len(payload['narrowed'])}) - still there, on fewer members than before"
+            )
+            for row in payload["narrowed"]:
+                marker = "!" if row["path"] in payload["meter_fields_narrowed"] else " "
+                lines.append(
+                    f"  {marker} {row['path']}: {row['now'][0]} of {row['now'][1]} "
+                    f"{_family_noun(row['family'])} (was {row['was'][0]} of {row['was'][1]})"
+                )
         if payload["removed"]:
             lines.append("")
             lines.append(f"REMOVED ({len(payload['removed'])})")
@@ -1314,14 +1456,32 @@ def render_drift(payload):
         if within["verdict"] == "unchanged":
             lines.append(
                 f"  identical to the shape recorded {when}: 0 removed, 0 added,"
-                " 0 retyped, no priced field touched."
+                " 0 retyped, no priced field lost a carrier."
             )
+        elif within["verdict"] == "unchanged_shape_only":
+            lines.append(
+                "  the shape is identical, but presence was not recorded for the baseline"
+            )
+            lines.append(
+                "  (it predates per-family counts), so a field dropped from one model would"
+            )
+            lines.append("  look exactly like this. That axis is unmeasured, not clean.")
         elif within["meter_fields_removed"]:
             lines.append(
                 "  a field that carried a price was removed WITHOUT a version change:"
             )
             for path in within["meter_fields_removed"]:
                 lines.append(f"    ! {path}")
+        elif within["narrowed"]:
+            lines.append(
+                "  a field is still present but on fewer members, WITHOUT a version change:"
+            )
+            for row in within["narrowed"]:
+                marker = "!" if row["path"] in within["meter_fields_narrowed"] else " "
+                lines.append(
+                    f"    {marker} {row['path']}: {row['now'][0]} of {row['now'][1]} "
+                    f"{_family_noun(row['family'])} (was {row['was'][0]} of {row['was'][1]})"
+                )
         else:
             if within["meter_fields_altered"]:
                 lines.append("  a field that carries a price changed type, same version:")
@@ -1347,14 +1507,13 @@ def render_drift(payload):
     lines.append(
         "meaning (a unit, a currency), or one that stays present and always 0, is invisible here."
     )
-    lines.append("LIMIT: no values are stored - only paths and type names.")
+    lines.append("LIMIT: no values are stored - only paths, type names and presence counts.")
     lines.append(
-        "LIMIT: model names are collapsed into one path, so a field removed from one model"
+        "LIMIT: list members (dailyActivity[]) are still collapsed to one path, so a field"
     )
     lines.append(
-        "and kept on another still reads as present here (measured: removing costUSD from"
+        "that one day carries and thirty-seven do not reads as present, not as 1 of 38."
     )
-    lines.append("1 of 9 models showed up as +1 field, not as a removal).")
     return "\n".join(lines) + "\n"
 
 
