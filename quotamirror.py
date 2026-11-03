@@ -2258,9 +2258,15 @@ def _table_overlap(left_days, right_days, left_label, right_label):
     return result
 
 
-def day_overlap(codex_days, claude_days):
-    """The two harnesses' day tables: shared days, one-sided days, and why."""
-    result = _table_overlap(codex_days, claude_days, "codex", "claude")
+def day_overlap(codex_days, claude_days, claude_label="claude"):
+    """The two harnesses' day tables: shared days, one-sided days, and why.
+
+    `claude_label` names which Claude table these days came from. When `compare`
+    measures the transcript window as well, the note has to say *cache table* --
+    otherwise "no day can be in both" reads as a statement about Claude as a
+    whole while a measured Claude table with shared days is printed below it.
+    """
+    result = _table_overlap(codex_days, claude_days, "codex", claude_label)
     result["days_codex_only"] = result.pop("days_left_only")
     result["days_claude_only"] = result.pop("days_right_only")
     return result
@@ -2335,6 +2341,18 @@ def compare_harnesses(
     codex_window = _window(codex_days, "record_timestamp")
     claude_window = _window(claude_days, "declared_attribution")
     claude_window_pair = _claude_window_pair(claude_days, claude_window, claude_transcripts)
+    # `overlap` measures the Claude side the cache declares. When a transcript
+    # scan ran, a second, measured Claude day table exists -- and it can land on
+    # the other side of the Codex window. Measuring only the cache table there
+    # would print "no day can be in both" while holding the shared days.
+    overlap_transcript = None
+    if claude_window_pair["available"]:
+        overlap_transcript = day_overlap(
+            codex_days,
+            claude_window_pair["transcript_scan"]["day_totals"],
+            claude_label="claude transcript",
+        )
+        overlap_transcript["basis"] = "transcript record timestamps"
     scope_fields = _scope_fields(claude_cache)
     claude_scope_reason = (
         "no field in the cache names a scope, so whether the total contains delegated "
@@ -2492,7 +2510,13 @@ def compare_harnesses(
         "claude_window": {k: v for k, v in claude_window_pair.items() if k != "transcript_scan"},
         "claude_day_crosscheck": crosscheck,
         "comparability": comparability,
-        "overlap": day_overlap(codex_days, claude_days),
+        "overlap": day_overlap(
+            codex_days,
+            claude_days,
+            claude_label="claude cache table" if overlap_transcript else "claude",
+        ),
+        "overlap_basis": "claude cache day table",
+        "overlap_transcript": overlap_transcript,
         "unit_note": (
             "the two totals are not the same quantity: Codex counts total_tokens as "
             "input+output with cached input nested inside input, while the Claude cache "
@@ -2521,6 +2545,51 @@ def _codex_summary_line(payload):
     ordered = ", ".join(f"{name} {count}" for name, count in sorted(verdicts.items()))
     return f"{codex['sessions']} session(s), {codex['tokens']:,} tokens from the delta column" + (
         f" ({ordered})" if ordered else ""
+    )
+
+
+def _render_overlap_block(title, overlap, lines):
+    lines.append(title)
+    if overlap["coverage"] == "no_days":
+        lines.append(f"  in both     : not measured -- {overlap['note']}")
+    else:
+        both_line = f"  in both     : {len(overlap['days_both'])}"
+        if overlap["note"]:
+            both_line += f" -- {overlap['note']}"
+        lines.append(both_line)
+    for label, key, side in (
+        ("codex only ", "days_codex_only", "codex"),
+        ("claude only", "days_claude_only", "claude"),
+    ):
+        days = overlap[key]
+        surface = f"  {label} : {len(days)}"
+        if days:
+            surface += f" ({', '.join(days[:6])})"
+        elif overlap["coverage"] == "shared_days":
+            # A zero here is a real measurement once both tables exist, but it
+            # still has to say what it measured: every day on THIS side is
+            # present on the other. (Naming the other side would invert it.)
+            surface += f" -- every {side} day is in both tables"
+        lines.append(surface)
+
+
+def _render_day_overlap(payload, lines):
+    """One Claude day table per block, each naming the table it measured.
+
+    Without a transcript scan there is exactly one Claude table and the plain
+    header stays plain. With one, the cache's declared days and the measured
+    record days are two different ranges that can sit on opposite sides of the
+    Codex window, so a single "claude" column would be answering a question the
+    reader cannot see.
+    """
+    measured = payload.get("overlap_transcript")
+    if measured is None:
+        _render_overlap_block("DAY OVERLAP", payload["overlap"], lines)
+        return
+    _render_overlap_block("DAY OVERLAP (claude side: cache day table)", payload["overlap"], lines)
+    lines.append("")
+    _render_overlap_block(
+        "DAY OVERLAP (claude side: transcript record dates)", measured, lines
     )
 
 
@@ -2578,19 +2647,7 @@ def render_compare(payload):
     lines.append("")
     _render_crosscheck(payload["claude_day_crosscheck"], lines)
     lines.append("")
-    lines.append("DAY OVERLAP")
-    overlap = payload["overlap"]
-    if overlap["coverage"] == "no_days":
-        lines.append(f"  in both     : not measured -- {overlap['note']}")
-    else:
-        both_line = f"  in both     : {len(overlap['days_both'])}"
-        if overlap["note"]:
-            both_line += f" -- {overlap['note']}"
-        lines.append(both_line)
-    lines.append(f"  codex only  : {len(payload['overlap']['days_codex_only'])}"
-                 + (f" ({', '.join(payload['overlap']['days_codex_only'][:6])})" if payload['overlap']['days_codex_only'] else ""))
-    lines.append(f"  claude only : {len(payload['overlap']['days_claude_only'])}"
-                 + (f" ({', '.join(payload['overlap']['days_claude_only'][:6])})" if payload['overlap']['days_claude_only'] else ""))
+    _render_day_overlap(payload, lines)
     lines.append("")
     lines.append("CLAUDE, TWO COUNTERS (one quantity, two windows)")
     pair = payload["claude_window"]
