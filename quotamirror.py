@@ -727,6 +727,21 @@ def render_text(payload, source="(unknown)"):
     return "\n".join(lines) + "\n"
 
 
+def _sample(items, limit):
+    """The first `limit` items, and how many were left out.
+
+    Every list this tool prints has a count on the same line. A list that simply
+    stops therefore reads as the whole list of a count it contradicts: the real
+    corpus printed "38 day(s) ... here:" followed by 8 dates and nothing else.
+    One sentence, so it cannot drift into three conventions (a bare "...", or no
+    marker at all, both of which survived here until this helper existed).
+    """
+    items = list(items)
+    shown = ", ".join(str(item) for item in items[:limit])
+    rest = len(items) - limit
+    return f"{shown}, +{rest} more" if rest > 0 else shown
+
+
 def _range(first, last):
     """A date range, or 'none' - never the word None in a reader-facing line."""
     if first is None and last is None:
@@ -1590,14 +1605,12 @@ def render_revise(payload, recorded=True):
     if payload["appeared"]:
         lines.append(
             f"  appeared in this reading only ({len(payload['appeared'])}): "
-            f"{', '.join(payload['appeared'][:4])}"
-            + (" ..." if len(payload["appeared"]) > 4 else "")
+            f"{_sample(payload['appeared'], 4)}"
         )
     if payload["vanished"]:
         lines.append(
             f"  present earlier, absent now ({len(payload['vanished'])}): "
-            f"{', '.join(payload['vanished'][:4])}"
-            + (" ..." if len(payload["vanished"]) > 4 else "")
+            f"{_sample(payload['vanished'], 4)}"
         )
         lines.append(
             "  absent is not zero: a key that stopped being published was not revised"
@@ -2564,7 +2577,7 @@ def _render_overlap_block(title, overlap, lines):
         days = overlap[key]
         surface = f"  {label} : {len(days)}"
         if days:
-            surface += f" ({', '.join(days[:6])})"
+            surface += f" ({_sample(days, 6)})"
         elif overlap["coverage"] == "shared_days":
             # A zero here is a real measurement once both tables exist, but it
             # still has to say what it measured: every day on THIS side is
@@ -2671,7 +2684,7 @@ def render_compare(payload):
                      f" | cache only: {len(pair['days_cache_only'])}")
         if pair["days_transcript_only"]:
             only = pair["days_transcript_only"]
-            shown = ", ".join(only[:6]) + (" ..." if len(only) > 6 else "")
+            shown = _sample(only, 6)
             pct = pair["pct_transcript_only"]
             lines.append(
                 f"    in the transcript, not in the cache table: {shown} -- "
@@ -2681,7 +2694,7 @@ def render_compare(payload):
         if pair["days_cache_only"]:
             only = pair["days_cache_only"]
             lines.append("    in the cache table, not in the transcript: "
-                         + ", ".join(only[:6]) + (" ..." if len(only) > 6 else ""))
+                         + _sample(only, 6))
         lines.append(f"  {pair['residual']['note']}")
     lines.append("")
     lines.append("PRICE")
@@ -3655,12 +3668,12 @@ def render_nested(payload):
         if windows["days_transcript_only"]:
             lines.append(
                 f"     {len(windows['days_transcript_only'])} day(s) carry transcript usage the cache's day "
-                f"table does not list: {', '.join(windows['days_transcript_only'][:8])}"
+                f"table does not list: {_sample(windows['days_transcript_only'], 8)}"
             )
         if windows["days_cache_only"]:
             lines.append(
                 f"     {len(windows['days_cache_only'])} day(s) are listed by the cache with no transcript here: "
-                f"{', '.join(windows['days_cache_only'][:8])}"
+                f"{_sample(windows['days_cache_only'], 8)}"
             )
         lines.append(
             "     `quotamirror compare` prints the second of these two windows; this command measures the "
