@@ -1027,13 +1027,24 @@ def _shape_walk(node, prefix=""):
                     carried = sum(1 for member in member_shapes if path in member)
                     presence[path] = [carried, len(members)]
     elif isinstance(node, list):
+        member_shapes = []
+        owned_deeper = set()
         for item in node:
             member_shape, member_presence = _shape_walk(item, prefix=f"{prefix[:-1]}[].")
+            member_shapes.append(member_shape)
+            owned_deeper.update(member_presence)
             shape.update(member_shape)
             for path, counts in member_presence.items():
                 total = presence.setdefault(path, [0, 0])
                 total[0] += counts[0]
                 total[1] += counts[1]
+        if len(node) > 1:
+            # A field that one day of a 38-day list carries and 37 do not is the
+            # same blind spot the model family had: present, but on 1 of 38.
+            every_path = {path for member in member_shapes for path in member}
+            for path in every_path - owned_deeper:
+                carried = sum(1 for member in member_shapes if path in member)
+                presence[path] = [carried, len(node)]
     return shape, presence
 
 
@@ -1047,7 +1058,7 @@ def shape_presence(receipt):
     return _shape_walk(receipt, "")[1]
 
 
-STORE_SCHEMA = 3
+STORE_SCHEMA = 4
 
 
 def path_identity(path):
@@ -1086,7 +1097,7 @@ def _migrate_store(store):
     future version has to be compared against; a baseline without presence is
     still a valid shape baseline, it just cannot answer the newer question.
     """
-    if store.get("schema") not in (2, STORE_SCHEMA):
+    if store.get("schema") not in (2, 3, STORE_SCHEMA):
         return {"schema": STORE_SCHEMA, "caches": {}}
     store["schema"] = STORE_SCHEMA
     return store
@@ -1107,6 +1118,10 @@ def record_shape(store_path, cache_path, receipt, captured_at=None):
     versions[key] = {
         "shape": shape_of(receipt),
         "presence": shape_presence(receipt),
+        # schema 4: presence also counts list members. A schema-3 baseline has
+        # counts for keyed families only, and has to say so rather than imply
+        # the list axis was measured.
+        "presence_lists": True,
         "at": captured_at or _utc_stamp(),
     }
 
@@ -1149,8 +1164,34 @@ def _is_meter_path(path):
     return any(word in leaf for word in METER_WORDS)
 
 
+def _list_name(path):
+    """The list a collapsed path lives in, or None when it holds no list member."""
+    if "[]" not in path:
+        return None
+    head = path.rsplit("[]", 1)[0]
+    return head.split(".")[-1] or None
+
+
+def _family_of(path):
+    """Which family a narrowed count is about - the innermost one in the path."""
+    marks = []
+    if "<model>" in path:
+        marks.append((path.rfind("<model>"), "<model>"))
+    if "<date>" in path:
+        marks.append((path.rfind("<date>"), "<date>"))
+    if "[]" in path:
+        marks.append((path.rfind("[]"), f"list:{_list_name(path)}"))
+    if not marks:
+        return "<date>"
+    return max(marks)[1]
+
+
 def _family_noun(segment):
-    return "model(s)" if segment == "<model>" else "day(s)"
+    if segment == "<model>":
+        return "model(s)"
+    if segment.startswith("list:"):
+        return f"{segment[len('list:'):]} member(s)"
+    return "day(s)"
 
 
 def _narrowed_rows(base, current, base_presence, current_presence):
@@ -1173,7 +1214,7 @@ def _narrowed_rows(base, current, base_presence, current_presence):
             rows.append(
                 {
                     "path": path,
-                    "family": "<model>" if "<model>" in path else "<date>",
+                    "family": _family_of(path),
                     "was": list(was),
                     "now": list(now),
                 }
@@ -1181,8 +1222,17 @@ def _narrowed_rows(base, current, base_presence, current_presence):
     return rows
 
 
-def _shape_diff(base, current, base_presence=None, current_presence=None, presence_compared=False):
+def _shape_diff(
+    base,
+    current,
+    base_presence=None,
+    current_presence=None,
+    presence_compared=False,
+    list_presence_compared=None,
+):
     """What changed between two shapes. Used by both drift axes."""
+    if list_presence_compared is None:
+        list_presence_compared = presence_compared
     removed = sorted(set(base) - set(current))
     added = sorted(set(current) - set(base))
     type_changed = [
@@ -1204,13 +1254,18 @@ def _shape_diff(base, current, base_presence=None, current_presence=None, presen
         verdict = "field_narrowed"
     elif removed or added or type_changed:
         verdict = "schema_changed"
-    elif not presence_compared:
-        # the shape axis is clean, but the axis that catches a per-model removal
-        # was never recorded for this baseline - an all-clear here would be a
-        # claim about a measurement nobody made
+    elif not (presence_compared and list_presence_compared):
+        # the shape axis is clean, but at least one presence axis was never
+        # recorded for this baseline - an all-clear here would be a claim about
+        # a measurement nobody made
         verdict = "unchanged_shape_only"
     else:
         verdict = "unchanged"
+    unmeasured = [
+        name
+        for name, compared in (("map", presence_compared), ("list", list_presence_compared))
+        if not compared
+    ]
     return {
         "verdict": verdict,
         "removed": removed,
@@ -1221,6 +1276,8 @@ def _shape_diff(base, current, base_presence=None, current_presence=None, presen
         "narrowed": narrowed,
         "meter_fields_narrowed": meter_narrowed,
         "presence_compared": presence_compared,
+        "list_presence_compared": list_presence_compared,
+        "presence_axes_unmeasured": unmeasured,
     }
 
 
@@ -1254,6 +1311,8 @@ def within_version_report(versions, current, current_key, current_presence=None)
         "narrowed": [],
         "meter_fields_narrowed": [],
         "presence_compared": False,
+        "list_presence_compared": False,
+        "presence_axes_unmeasured": [],
         "same_as_recorded_at": None,
     }
     base = entry.get("shape")
@@ -1266,6 +1325,8 @@ def within_version_report(versions, current, current_key, current_presence=None)
         base_presence,
         current_presence,
         presence_compared=base_presence is not None and current_presence is not None,
+        list_presence_compared=bool(entry.get("presence_lists"))
+        and current_presence is not None,
     )
     payload.update(diff)
     payload.update(
@@ -1311,6 +1372,8 @@ def drift_report(store, cache_path, receipt):
         "narrowed": [],
         "meter_fields_narrowed": [],
         "presence_compared": False,
+        "list_presence_compared": False,
+        "presence_axes_unmeasured": [],
     }
     payload["within_version"] = within_version_report(
         versions, current, current_key, current_presence
@@ -1328,6 +1391,8 @@ def drift_report(store, cache_path, receipt):
         base_presence,
         current_presence,
         presence_compared=base_presence is not None and current_presence is not None,
+        list_presence_compared=bool(baseline.get("presence_lists"))
+        and current_presence is not None,
     )
     removed = diff["removed"]
     added = diff["added"]
@@ -1349,10 +1414,39 @@ def drift_report(store, cache_path, receipt):
             "narrowed": diff["narrowed"],
             "meter_fields_narrowed": diff["meter_fields_narrowed"],
             "presence_compared": diff["presence_compared"],
+            "list_presence_compared": diff["list_presence_compared"],
+            "presence_axes_unmeasured": diff["presence_axes_unmeasured"],
             "fields_baseline": len(base),
         }
     )
     return payload
+
+
+def _presence_gap_lines(unmeasured):
+    """Why a clean shape is not a clean receipt when a presence axis is missing.
+
+    Two axes are now counted - keyed families (model / day) and list members -
+    and a baseline can have one without the other. Naming which one is missing
+    is the difference between 'unmeasured' and a clean bill.
+    """
+    head = "  the shape is identical, but presence was not recorded for the baseline"
+    if len(unmeasured) > 1 or not unmeasured:
+        return [
+            head + " at all, so a field dropped",
+            "  from one model or one list member would look exactly like this. That axis is",
+            "  unmeasured, not clean.",
+        ]
+    if unmeasured == ["list"]:
+        return [
+            head + "'s",
+            "  list members, so a field dropped from one day of a list would look exactly",
+            "  like this. That axis is unmeasured, not clean.",
+        ]
+    return [
+        head + "'s",
+        "  model / day counts, so a field dropped from one of those would look exactly",
+        "  like this. That axis is unmeasured, not clean.",
+    ]
 
 
 def render_drift(payload):
@@ -1459,13 +1553,7 @@ def render_drift(payload):
                 " 0 retyped, no priced field lost a carrier."
             )
         elif within["verdict"] == "unchanged_shape_only":
-            lines.append(
-                "  the shape is identical, but presence was not recorded for the baseline"
-            )
-            lines.append(
-                "  (it predates per-family counts), so a field dropped from one model would"
-            )
-            lines.append("  look exactly like this. That axis is unmeasured, not clean.")
+            lines.extend(_presence_gap_lines(within["presence_axes_unmeasured"]))
         elif within["meter_fields_removed"]:
             lines.append(
                 "  a field that carried a price was removed WITHOUT a version change:"
@@ -1509,11 +1597,13 @@ def render_drift(payload):
     )
     lines.append("LIMIT: no values are stored - only paths, type names and presence counts.")
     lines.append(
-        "LIMIT: list members (dailyActivity[]) are still collapsed to one path, so a field"
+        "LIMIT: a list that rolls over (a window of days) can lose a carrier because an old"
     )
     lines.append(
-        "that one day carries and thirty-seven do not reads as present, not as 1 of 38."
+        "member left the window, not because the vendor dropped the field, and the count"
     )
+    lines.append("cannot tell those two apart. Two lists under different keys also fold into")
+    lines.append("one count, so '2 of 8' can mean 1 of 3 plus 1 of 5.")
     return "\n".join(lines) + "\n"
 
 

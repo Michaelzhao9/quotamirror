@@ -14,7 +14,9 @@ record, next to the shape, how many members of each collapsed family carried
 each path - so "present" can be read as "on 8 of 9 models" instead of "present".
 
 Families are the two collapsed key spaces (`<model>` and `<date>`). List members
-(`dailyActivity[]`) are still uncounted, and a rendered run has to say so.
+were the remaining hole; they are counted now and covered by
+`tests/test_list_presence.py`. What survives here is the rendered limit for lists
+that roll over on their own.
 """
 
 import json
@@ -108,7 +110,7 @@ def test_the_store_keeps_presence_counts_beside_the_shape(tmp_path):
         "versions"
     ]["5/5"]
     assert entry["presence"]["modelUsage.<model>.costUSD"] == [8, 9]
-    assert set(entry) == {"shape", "presence", "at"}
+    assert set(entry) == {"shape", "presence", "presence_lists", "at"}
 
 
 def test_upgrading_a_schema_2_store_keeps_its_baseline(tmp_path):
@@ -186,6 +188,7 @@ def test_the_rendered_drift_names_how_many_models_kept_the_field(tmp_path):
 
     assert "VERDICT: meter_field_narrowed" in text
     assert "modelUsage.<model>.costUSD: 8 of 9 model(s) (was 9 of 9)" in text
-    # the limit that is still true has to survive the fix
-    assert "list member" in text.lower()
+    # the limit that is still true has to survive the fix: a list that rolls over
+    # can lose a carrier without the vendor having dropped anything
+    assert "rolls over" in text.lower()
     assert "collapsed into one path" not in text
