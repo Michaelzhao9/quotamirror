@@ -2294,9 +2294,21 @@ def compare_harnesses(
             messages=transcripts["messages"],
         )
     floor, tol = _floor(min_tokens, tolerance)
+    read_nothing = (claude_window_pair.get("observation") or {}).get("verdict") in {
+        "store_empty",
+        "no_usage_records",
+    }
+    if transcripts is not None:
+        crosscheck_scan = {"days": transcripts["days"]}
+    elif read_nothing:
+        # The flag was passed and the directory was read; it held no usage day.
+        # Passing None here would make the crosscheck report a missing flag.
+        crosscheck_scan = {"days": {}}
+    else:
+        crosscheck_scan = None
     crosscheck = crosscheck_days(
         claude_days,
-        {"days": transcripts["days"]} if transcripts is not None else None,
+        crosscheck_scan,
         min_tokens=floor,
         tolerance=tol,
     )
@@ -2883,6 +2895,7 @@ def crosscheck_days(cache_days, scan, min_tokens=1_000_000, tolerance=0.02):
     empty = {
         "available": scan is not None,
         "verdict": "unavailable",
+        "coverage": "not_read",
         "days": [],
         "days_compared": 0,
         "days_below_floor": 0,
@@ -2902,13 +2915,13 @@ def crosscheck_days(cache_days, scan, min_tokens=1_000_000, tolerance=0.02):
         )
         return empty
 
-    shared = sorted(set(cache_days) & set(transcript_days))
+    shared = _table_overlap(cache_days, transcript_days, "cache table", "transcript")
     rows = []
     below_floor = 0
-    for date in shared:
-        table = transcript_days[date] or {}
-        merged = int(table.get("total_tokens") or 0)
-        naive = int(table.get("naive_tokens") or 0)
+    for date in shared["days_both"]:
+        entry = transcript_days[date] or {}
+        merged = int(entry.get("total_tokens") or 0)
+        naive = int(entry.get("naive_tokens") or 0)
         cache_value = int(cache_days.get(date) or 0)
         if max(cache_value, merged, naive) < min_tokens:
             below_floor += 1
@@ -2941,8 +2954,8 @@ def crosscheck_days(cache_days, scan, min_tokens=1_000_000, tolerance=0.02):
     result["days"] = rows
     result["days_compared"] = len(rows)
     result["days_below_floor"] = below_floor
-    result["days_cache_only"] = len(set(cache_days) - set(transcript_days))
-    result["days_transcript_only"] = len(set(transcript_days) - set(cache_days))
+    result["days_cache_only"] = len(shared["days_left_only"])
+    result["days_transcript_only"] = len(shared["days_right_only"])
     result["cache_tokens"] = sum(row["cache"] for row in rows)
     result["merged_tokens"] = sum(row["merged"] for row in rows)
     result["naive_tokens"] = sum(row["naive"] for row in rows)
@@ -2958,11 +2971,18 @@ def crosscheck_days(cache_days, scan, min_tokens=1_000_000, tolerance=0.02):
     result["days_matching_neither"] = neither_days
     if not rows:
         result["verdict"] = "no_overlap"
-        result["reason"] = (
-            "no day is both above the token floor and present in both sources, so the two "
-            "day tables cannot be compared here"
-        )
+        if shared["coverage"] == "shared_days":
+            result["coverage"] = "all_below_floor"
+            result["reason"] = (
+                f"{below_floor} shared day(s) exist, but every one is under the "
+                f"{min_tokens:,}-token floor, so none of them may decide the verdict "
+                "(the floor is this check's rule, not a fact about the cache)"
+            )
+        else:
+            result["coverage"] = shared["coverage"]
+            result["reason"] = shared["note"]
     elif record_sum_days > merged_days:
+        result["coverage"] = "shared_days"
         result["verdict"] = "record_sum_confirmed"
         result["reason"] = (
             f"{record_sum_days} of {len(rows)} comparable day(s) match the record sum and "
@@ -2971,6 +2991,7 @@ def crosscheck_days(cache_days, scan, min_tokens=1_000_000, tolerance=0.02):
             "message, so its day table is a record sum and not a bill"
         )
     elif merged_days > record_sum_days:
+        result["coverage"] = "shared_days"
         result["verdict"] = "merged_confirmed"
         result["reason"] = (
             f"{merged_days} of {len(rows)} comparable day(s) match the merged total and "
@@ -2979,6 +3000,7 @@ def crosscheck_days(cache_days, scan, min_tokens=1_000_000, tolerance=0.02):
             "one count per message"
         )
     else:
+        result["coverage"] = "shared_days"
         result["verdict"] = "mixed"
         result["reason"] = (
             f"the comparable days split evenly ({record_sum_days} record sum, {merged_days} "
@@ -2992,6 +3014,11 @@ def _render_crosscheck(result, lines):
     if not result["available"]:
         lines.append(f"  not measured -- {result['reason']}")
         return
+    if result.get("coverage") == "no_days":
+        # One side produced no day at all: printing the other side's count beside
+        # it would read as a one-sided comparison, which is not what happened.
+        lines.append(f"  not measured -- {result['reason']}")
+        return
     lines.append(
         f"  compared {result['days_compared']} day(s) of at least {result['min_tokens']:,} tokens "
         f"(within {int(result['tolerance'] * 100)}% counts as a match); "
@@ -2999,7 +3026,7 @@ def _render_crosscheck(result, lines):
         f"{result['days_cache_only']} cache-only, {result['days_transcript_only']} transcript-only"
     )
     if not result["days"]:
-        lines.append(f"  {result['reason']}")
+        lines.append(f"  verdict: {result['verdict']} -- {result['reason']}")
         return
     lines.append(
         f"  cache {result['cache_tokens']:,} | merged {result['merged_tokens']:,} | "
@@ -3085,6 +3112,7 @@ def _undecided_arbitration(floor, tol, reason):
     return {
         "available": False,
         "verdict": "undecided",
+        "coverage": "not_read",
         "reason": reason,
         "days": [],
         "days_compared": 0,
@@ -3412,7 +3440,7 @@ def render_nested(payload):
         else:
             lines.append(
                 f"  which total is the bill: {arbitration['verdict']} over "
-                f"{arbitration['days_compared']} shared day(s) of at least "
+                f"{arbitration['days_compared']} comparable day(s) of at least "
                 f"{arbitration['min_tokens']:,} tokens (within "
                 f"{round(arbitration['tolerance'] * 100)}% counts as a match) -- "
                 f"{arbitration['reason']}"

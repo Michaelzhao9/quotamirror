@@ -131,6 +131,22 @@ def test_the_floor_and_tolerance_are_printed_as_used(tmp_path):
     assert "50%" in text
 
 
+def test_the_arbitration_line_does_not_call_below_floor_days_unshared(tmp_path):
+    """Shared days under the floor are shared, not absent: the line says comparable."""
+    write_transcripts(tmp_path, streamed_twice())
+    cache = cache_with_day_totals({"2026-05-01": 200, "2026-05-02": 10})
+
+    payload = quotamirror.nested_audit(tmp_path, cache=cache, min_tokens=1_000_000)
+    arbitration = payload["inflation"]["arbitration"]
+    text = quotamirror.render_nested(payload)
+
+    assert arbitration["verdict"] == "no_overlap"
+    assert arbitration["coverage"] == "all_below_floor"
+    line_text = next(item for item in text.splitlines() if "which total is the bill" in item)
+    assert "0 comparable day(s)" in line_text
+    assert "2 shared day(s) exist" in line_text
+
+
 def cli_compare(tmp_path, transcripts, cache_day_totals, extra):
     write_rollout = tmp_path / "rollout-2026-05-01T00-00-00.jsonl"
     write_rollout.write_text(
