@@ -1019,8 +1019,18 @@ def load_store(store_path):
     return store
 
 
+def _utc_stamp():
+    """One timestamp format for everything this tool writes to disk."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def record_shape(store_path, cache_path, receipt, captured_at=None):
-    """Persist a receipt's shape under its declared version. Values never reach disk."""
+    """Persist a receipt's shape under its declared version. Values never reach disk.
+
+    The entry carries the shape *and* when it was seen, because the useful
+    comparison is not shape-against-itself: `drift` reads the store before it
+    writes, so what sits here is the baseline this run is diffed against.
+    """
     if store_path.is_symlink():
         raise ValueError(f"refusing symlink shape store: {store_path}")
     store = load_store(store_path)
@@ -1029,7 +1039,11 @@ def record_shape(store_path, cache_path, receipt, captured_at=None):
     key, _ = _version_of(receipt)
     versions = store["caches"].setdefault(path_identity(cache_path), {}).setdefault("versions", {})
     versions.pop(key, None)
-    versions[key] = {"shape": shape_of(receipt)}
+    versions[key] = {
+        "shape": shape_of(receipt),
+        "at": captured_at or _utc_stamp(),
+    }
+
     store_path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary = tempfile.mkstemp(prefix=f".{store_path.name}.", dir=store_path.parent)
     try:
@@ -1069,6 +1083,84 @@ def _is_meter_path(path):
     return any(word in leaf for word in METER_WORDS)
 
 
+def _shape_diff(base, current):
+    """What changed between two shapes. Used by both drift axes."""
+    removed = sorted(set(base) - set(current))
+    added = sorted(set(current) - set(base))
+    type_changed = [
+        {"path": path, "was": base[path], "now": current[path]}
+        for path in sorted(set(base) & set(current))
+        if base[path] != current[path]
+    ]
+    meter_removed = [path for path in removed if _is_meter_path(path)]
+    meter_altered = [row["path"] for row in type_changed if _is_meter_path(row["path"])]
+    if meter_removed:
+        verdict = "meter_field_removed"
+    elif meter_altered:
+        verdict = "meter_field_altered"
+    elif removed or added or type_changed:
+        verdict = "schema_changed"
+    else:
+        verdict = "unchanged"
+    return {
+        "verdict": verdict,
+        "removed": removed,
+        "added": added,
+        "type_changed": type_changed,
+        "meter_fields_removed": meter_removed,
+        "meter_fields_altered": meter_altered,
+    }
+
+
+WITHIN_REASONS = {
+    "no_shape_recorded_at_this_version": (
+        "no shape is recorded at this version - either nothing has been recorded for"
+        " this file, or --no-record left the store untouched"
+    ),
+}
+
+
+def within_version_report(versions, current, current_key):
+    """This version against the last shape recorded at the same version.
+
+    Fed the store as it is *before* this run records, so `entry["shape"]` is the
+    previous shape at this version rather than the one just written.
+    """
+    entry = versions.get(current_key) or {}
+    payload = {
+        "measurable": False,
+        "reason": "no_shape_recorded_at_this_version",
+        "reason_text": WITHIN_REASONS["no_shape_recorded_at_this_version"],
+        "baseline_at": None,
+        "fields_baseline": 0,
+        "verdict": "not_measured",
+        "removed": [],
+        "added": [],
+        "type_changed": [],
+        "meter_fields_removed": [],
+        "meter_fields_altered": [],
+        "same_as_recorded_at": None,
+    }
+    base = entry.get("shape")
+    if not base:
+        return payload
+    diff = _shape_diff(base, current)
+    payload.update(diff)
+    payload.update(
+        {
+            "measurable": True,
+            "reason": None,
+            "reason_text": None,
+            "baseline_at": entry.get("at"),
+            "fields_baseline": len(base),
+            "same_as_recorded_at": entry.get("at")
+            if diff["verdict"] == "unchanged"
+            else None,
+        }
+    )
+    return payload
+
+
 def drift_report(store, cache_path, receipt):
     """Compare a receipt's current shape with the last shape recorded at another version."""
     caches = store.get("caches", {})
@@ -1094,29 +1186,20 @@ def drift_report(store, cache_path, receipt):
         "meter_fields_removed": [],
         "meter_fields_altered": [],
     }
+    payload["within_version"] = within_version_report(versions, current, current_key)
     if not others:
         return payload
 
     baseline_key = next(reversed(others))
     baseline = others[baseline_key]
+    diff = _shape_diff(baseline.get("shape") or {}, current)
     base = baseline.get("shape") or {}
-    removed = sorted(set(base) - set(current))
-    added = sorted(set(current) - set(base))
-    type_changed = [
-        {"path": path, "was": base[path], "now": current[path]}
-        for path in sorted(set(base) & set(current))
-        if base[path] != current[path]
-    ]
-    meter_removed = [path for path in removed if _is_meter_path(path)]
-    meter_altered = [row["path"] for row in type_changed if _is_meter_path(row["path"])]
-    if meter_removed:
-        verdict = "meter_field_removed"
-    elif meter_altered:
-        verdict = "meter_field_altered"
-    elif removed or added or type_changed:
-        verdict = "schema_changed"
-    else:
-        verdict = "unchanged"
+    removed = diff["removed"]
+    added = diff["added"]
+    type_changed = diff["type_changed"]
+    meter_removed = diff["meter_fields_removed"]
+    meter_altered = diff["meter_fields_altered"]
+    verdict = diff["verdict"]
     payload.update(
         {
             "baseline_version_key": baseline_key,
@@ -1146,19 +1229,18 @@ def render_drift(payload):
         )
     lines.append("")
     if not payload["measurable"]:
-        lines.append("  baseline: none")
+        lines.append("  baseline: none at another version")
         lines.append("")
         lines.append("VERDICT: no_baseline")
         lines.append(
-            "  This is the first shape recorded for this receipt version, so there is nothing"
+            "  No other receipt version has a shape recorded for this file, so a change"
         )
         lines.append(
-            "  to compare it against. Drift is unmeasurable on this machine until the harness"
+            "  across versions is unmeasurable here - that needs the harness to publish a"
         )
         lines.append(
-            "  publishes a different version. The shape just recorded is what the next one"
+            "  different version. This version against its own last shape is measured below."
         )
-        lines.append("  will be diffed against - this run cannot tell you whether it changed.")
         lines.append("")
         versions = ", ".join(payload["versions_recorded"]) or "none"
         lines.append(f"  versions recorded for this file: {versions}")
@@ -1206,6 +1288,44 @@ def render_drift(payload):
                 for row in other:
                     lines.append(f"  ~ {row['path']}: {row['was']} -> {row['now']}")
     lines.append("")
+    within = payload["within_version"]
+    lines.append(f"SINCE THE LAST SHAPE AT THIS VERSION ({payload['version_key']})")
+    if not within["measurable"]:
+        lines.append(f"  not measured -- {within['reason_text']}")
+    else:
+        when = within["baseline_at"] or "before timestamps were kept"
+        lines.append(f"  baseline: recorded {when} ({_fmt(within['fields_baseline'])} fields)")
+        lines.append(f"VERDICT: {within['verdict']}")
+        if within["verdict"] == "unchanged":
+            lines.append(
+                f"  identical to the shape recorded {when}: 0 removed, 0 added,"
+                " 0 retyped, no priced field touched."
+            )
+        elif within["meter_fields_removed"]:
+            lines.append(
+                "  a field that carried a price was removed WITHOUT a version change:"
+            )
+            for path in within["meter_fields_removed"]:
+                lines.append(f"    ! {path}")
+        else:
+            if within["meter_fields_altered"]:
+                lines.append("  a field that carries a price changed type, same version:")
+                for row in within["type_changed"]:
+                    if row["path"] in within["meter_fields_altered"]:
+                        lines.append(f"    {row['path']}: {row['was']} -> {row['now']}")
+            lines.append(
+                f"  removed {len(within['removed'])}, added {len(within['added'])},"
+                f" retyped {len(within['type_changed'])}"
+            )
+            for path in within["removed"]:
+                lines.append(f"    - {path}")
+        if within["verdict"] != "unchanged":
+            lines.append("")
+            lines.append(
+                "  A version number is the vendor's claim that the shape did not move."
+            )
+            lines.append("  This section is the check on that claim.")
+    lines.append("")
     lines.append(
         "LIMIT: names and types only. A field that keeps its name and type but changes"
     )
@@ -1213,6 +1333,13 @@ def render_drift(payload):
         "meaning (a unit, a currency), or one that stays present and always 0, is invisible here."
     )
     lines.append("LIMIT: no values are stored - only paths and type names.")
+    lines.append(
+        "LIMIT: model names are collapsed into one path, so a field removed from one model"
+    )
+    lines.append(
+        "and kept on another still reads as present here (measured: removing costUSD from"
+    )
+    lines.append("1 of 9 models showed up as +1 field, not as a removal).")
     return "\n".join(lines) + "\n"
 
 
@@ -1284,7 +1411,7 @@ def record_reading(store_path, cache_path, receipt, recorded_at=None):
     if store.get("schema") != READINGS_SCHEMA:
         store = {"schema": READINGS_SCHEMA, "caches": {}}
     reading = reading_of(receipt)
-    reading["at"] = recorded_at or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reading["at"] = recorded_at or _utc_stamp()
     entry = store["caches"].setdefault(path_identity(cache_path), {})
     readings = entry.setdefault("readings", [])
     readings.append(reading)
@@ -3795,14 +3922,15 @@ def main(argv=None):
             return 2
         store_path = Path(args.store)
         try:
-            if args.no_record:
-                store = load_store(store_path)
-            else:
-                store, _ = record_shape(store_path, cache_path, cache)
+            # read before writing: the shape sitting in the store is the baseline
+            # this receipt is diffed against for a change *inside* one version
+            store = load_store(store_path)
+            payload = drift_report(store, cache_path, cache)
+            if not args.no_record:
+                record_shape(store_path, cache_path, cache)
         except (OSError, ValueError) as exc:
             print(f"quotamirror: cannot use store {store_path}: {exc}", file=sys.stderr)
             return 2
-        payload = drift_report(store, cache_path, cache)
         payload = redact_home(payload)
         if args.json:
             print(json.dumps(payload, indent=2, sort_keys=True))

@@ -115,7 +115,8 @@ def test_record_keeps_only_normalized_shape_under_a_path_digest(tmp_path):
     store = quotamirror.load_store(store_file)
     assert list(store["caches"]) == [quotamirror.path_identity(path)]
     entry = store["caches"][quotamirror.path_identity(path)]["versions"]["5/5"]
-    assert entry == {"shape": quotamirror.shape_of(receipt(note=SENTINEL))}
+    assert entry["shape"] == quotamirror.shape_of(receipt(note=SENTINEL))
+    assert set(entry) == {"shape", "at"}
     assert "modelUsage.<model>.inputTokens" in entry["shape"]
 
 
@@ -131,7 +132,7 @@ def test_record_keeps_the_shape_and_no_value(tmp_path):
     store = quotamirror.load_store(store_file)
     entry = store["caches"][quotamirror.path_identity(path)]["versions"]["5/5"]
     assert entry["shape"] == quotamirror.shape_of(receipt(note=SENTINEL))
-    assert set(entry) == {"shape"}
+    assert set(entry) == {"shape", "at"}
 
 
 def test_recording_the_same_version_twice_updates_one_entry(tmp_path):
@@ -142,7 +143,7 @@ def test_recording_the_same_version_twice_updates_one_entry(tmp_path):
 
     versions = quotamirror.load_store(store_file)["caches"][quotamirror.path_identity(path)]["versions"]
     assert list(versions) == ["5/5"]
-    assert set(versions["5/5"]) == {"shape"}
+    assert versions["5/5"]["at"] == "2026-10-29T06:00:00Z"
 
 
 def test_store_file_is_private(tmp_path):
@@ -215,7 +216,7 @@ def test_two_version_fields_that_disagree_are_reported_without_stored_state(tmp_
     )
     store = quotamirror.load_store(store_file)
     entry = store["caches"][quotamirror.path_identity(path)]["versions"]["5/4"]
-    assert set(entry) == {"shape"}
+    assert set(entry) == {"shape", "at"}
     assert quotamirror.drift_report(store, path, receipt(version=5, dailyModelTokensVersion=4))["version_fields_disagree"] is True
 
 
@@ -486,3 +487,125 @@ def test_a_removed_meter_field_is_listed_once_not_twice(tmp_path):
 
     assert result.stdout.count("modelUsage.<model>.costUSD") == 1
     assert "! modelUsage.<model>.costUSD" in result.stdout
+
+
+
+# --- one version can move on its own -----------------------------------------
+#
+# The across-version sampler compares the current receipt with a shape recorded at
+# a *different* version, so a harness that deletes a field without bumping
+# `version` is invisible. The store has always kept one shape per version and the
+# command rewrote that shape before anyone could diff against it, so the second
+# axis is a read-before-write: whatever sits in the store is the baseline.
+
+
+def _within(payload):
+    return payload["within_version"]
+
+
+def test_the_recorded_shape_carries_when_it_was_seen(tmp_path):
+    path = tmp_path / "stats-cache.json"
+    store_file = tmp_path / "shapes.json"
+
+    quotamirror.record_shape(store_file, path, receipt(), captured_at="2026-11-01T00:00:00Z")
+
+    entry = quotamirror.load_store(store_file)["caches"][quotamirror.path_identity(path)]["versions"]["5/5"]
+    assert entry == {"shape": quotamirror.shape_of(receipt()), "at": "2026-11-01T00:00:00Z"}
+
+
+def test_a_within_version_change_is_visible_against_the_store_written_before_it(tmp_path):
+    path = tmp_path / "stats-cache.json"
+    store_file = tmp_path / "shapes.json"
+    before = receipt()
+    after = receipt()
+    del after["modelUsage"]["claude-sonnet-4-5"]["costUSD"]
+
+    quotamirror.record_shape(store_file, path, before, captured_at="2026-11-01T00:00:00Z")
+    payload = quotamirror.drift_report(quotamirror.load_store(store_file), path, after)
+
+    within = _within(payload)
+    assert within["measurable"] is True
+    assert within["verdict"] == "meter_field_removed"
+    assert within["meter_fields_removed"] == ["modelUsage.<model>.costUSD"]
+    assert within["baseline_at"] == "2026-11-01T00:00:00Z"
+    # the across-version axis is still unmeasured, and says so separately
+    assert payload["verdict"] == "no_baseline"
+
+
+def test_an_unchanged_shape_names_the_time_it_was_recorded(tmp_path):
+    path = tmp_path / "stats-cache.json"
+    store_file = tmp_path / "shapes.json"
+
+    quotamirror.record_shape(store_file, path, receipt(), captured_at="2026-11-01T00:00:00Z")
+    payload = quotamirror.drift_report(
+        quotamirror.load_store(store_file), path, receipt()
+    )
+
+    within = _within(payload)
+    assert within["measurable"] is True
+    assert within["verdict"] == "unchanged"
+    assert within["same_as_recorded_at"] == "2026-11-01T00:00:00Z"
+
+
+def test_a_store_written_before_timestamps_existed_is_still_comparable(tmp_path):
+    path = tmp_path / "stats-cache.json"
+    store_file = tmp_path / "shapes.json"
+    legacy = {
+        "schema": quotamirror.STORE_SCHEMA,
+        "caches": {
+            quotamirror.path_identity(path): {
+                "versions": {"5/5": {"shape": quotamirror.shape_of(receipt())}}
+            }
+        },
+    }
+    store_file.write_text(json.dumps(legacy), encoding="utf-8")
+
+    payload = quotamirror.drift_report(quotamirror.load_store(store_file), path, receipt())
+
+    within = _within(payload)
+    assert within["measurable"] is True
+    assert within["verdict"] == "unchanged"
+    assert within["baseline_at"] is None
+
+
+def test_a_version_with_no_recorded_shape_is_not_measured(tmp_path):
+    path = tmp_path / "stats-cache.json"
+    store_file = tmp_path / "shapes.json"
+
+    payload = quotamirror.drift_report(quotamirror.load_store(store_file), path, receipt())
+
+    within = _within(payload)
+    assert within["measurable"] is False
+    assert within["verdict"] == "not_measured"
+    assert within["reason"] == "no_shape_recorded_at_this_version"
+    assert within["removed"] == [] and within["meter_fields_removed"] == []
+
+
+def test_cli_second_run_names_a_meter_field_removed_without_a_version_change(tmp_path):
+    cache = tmp_path / "stats-cache.json"
+    store = tmp_path / "shapes.json"
+    cache.write_text(json.dumps(receipt()), encoding="utf-8")
+    assert run_cli(["drift", "--path", str(cache), "--store", str(store)], cwd=tmp_path).returncode == 0
+
+    after = receipt()
+    del after["modelUsage"]["claude-sonnet-4-5"]["costUSD"]
+    cache.write_text(json.dumps(after), encoding="utf-8")
+    result = run_cli(["drift", "--path", str(cache), "--store", str(store)], cwd=tmp_path)
+
+    assert result.returncode == 0, result.stderr
+    assert "SINCE THE LAST SHAPE AT THIS VERSION (5/5)" in result.stdout
+    assert "meter_field_removed" in result.stdout
+    assert "WITHOUT a version change" in result.stdout
+    assert result.stdout.count("modelUsage.<model>.costUSD") == 1
+
+
+def test_cli_first_run_does_not_print_within_version_counts(tmp_path):
+    cache = tmp_path / "stats-cache.json"
+    store = tmp_path / "shapes.json"
+    cache.write_text(json.dumps(receipt()), encoding="utf-8")
+
+    result = run_cli(["drift", "--path", str(cache), "--store", str(store)], cwd=tmp_path)
+
+    assert "SINCE THE LAST SHAPE AT THIS VERSION (5/5)" in result.stdout
+    assert "not measured" in result.stdout
+    assert "removed 0" not in result.stdout
