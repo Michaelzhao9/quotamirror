@@ -1538,25 +1538,32 @@ def drift_report(store, cache_path, receipt):
         # alone: it rests on the other version's record, not on this one.
         payload["verdict"] = within_verdict
     # The upgrade case: version A has a record, version B was just published, and
-    # this is the first read at B. A removal-only difference here cannot be told
-    # from a read taken while the file was being rewritten - and the within-version
-    # axis has nothing at B to check it against. Naming a vendor deletion from that
-    # one read would be the r89 defect stated across versions. The paths are
-    # reported unconfirmed, and the read is still recorded: the same smaller shape
-    # read twice at B is what makes it a removal (test_cross_version_removal).
+    # this is the first read at B. A difference that only subtracts - whole paths
+    # gone, or a field gone from part of a family - cannot be told from a read
+    # taken while the file was being rewritten, and the within-version axis has
+    # nothing at B to check it against. Naming a vendor change from that one read
+    # would be the r89 defect stated across versions. Both lists are reported
+    # unconfirmed, and the read is still recorded: the same shape read twice at B
+    # is what makes it a removal or a narrowing (tests/test_cross_version_*).
+    narrowing = diff["narrowed"]
     if (
         within_verdict not in ("possible_partial_read", "possible_short_baseline")
-        and removed
         and not added
         and not type_changed
-        and not diff["narrowed"]
+        and (removed or narrowing)
     ):
         entry_here = versions.get(current_key) or {}
         seen_here = bool(entry_here.get("shape")) and shape_digest(
             entry_here["shape"]
         ) == shape_digest(current)
         if not seen_here:
-            payload["verdict"] = "removal_unconfirmed"
+            priced = list(meter_removed)
+            for row in narrowing:
+                if _is_meter_path(row["path"]) and row["path"] not in priced:
+                    priced.append(row["path"])
+            payload["verdict"] = (
+                "removal_unconfirmed" if removed else "narrowing_unconfirmed"
+            )
             payload["cross_version_unconfirmed"] = {
                 "version_key": current_key,
                 "baseline_version_key": baseline_key,
@@ -1564,7 +1571,8 @@ def drift_report(store, cache_path, receipt):
                 "fields_baseline": len(base),
                 "fields_now": len(current),
                 "fields_unconfirmed": removed,
-                "priced_unconfirmed": meter_removed,
+                "priced_unconfirmed": priced,
+                "narrowed_unconfirmed": narrowing,
                 "reads_at_current": entry_here.get("reads"),
             }
     return payload
@@ -1700,11 +1708,49 @@ def render_drift(payload):
             for path in part.get("fields_unconfirmed") or []:
                 marker = "!" if path in (part.get("priced_unconfirmed") or []) else " "
                 lines.append(f"  {marker} {path} (unconfirmed)")
+            for row in part.get("narrowed_unconfirmed") or []:
+                marker = "!" if row["path"] in (part.get("priced_unconfirmed") or []) else " "
+                lines.append(
+                    f"  {marker} {row['path']}: {row['now'][0]} of {row['now'][1]} "
+                    f"{_family_noun(row['family'])} (was {row['was'][0]} of "
+                    f"{row['was'][1]}) (unconfirmed)"
+                )
             lines.append(
                 "  Run drift again on the settled file: the same smaller shape twice at this"
             )
             lines.append(
                 "  version is a removal; the fuller shape again means this read was the short one."
+            )
+        elif payload["verdict"] == "narrowing_unconfirmed":
+            part = payload.get("cross_version_unconfirmed") or {}
+            rows = part.get("narrowed_unconfirmed") or []
+            lines.append(
+                f"  this is the first read at version {part.get('version_key')}. Every field"
+            )
+            lines.append(
+                f"  recorded at version {part.get('baseline_version_key')} is still there and"
+            )
+            lines.append("  nothing it kept changed type, but the fields below sit on fewer")
+            lines.append("  family members than they did:")
+            for row in rows:
+                marker = "!" if row["path"] in (part.get("priced_unconfirmed") or []) else " "
+                lines.append(
+                    f"  {marker} {row['path']}: {row['now'][0]} of {row['now'][1]} "
+                    f"{_family_noun(row['family'])} (was {row['was'][0]} of "
+                    f"{row['was'][1]}) (unconfirmed)"
+                )
+            lines.append(
+                "  A vendor that narrowed a field and a read taken while the file was being"
+            )
+            lines.append(
+                "  rewritten produce the same picture in one read, and this version has no"
+            )
+            lines.append("  earlier record to settle it. So no narrowing is named here.")
+            lines.append(
+                "  Run drift again on the settled file: the same narrower shape twice at this"
+            )
+            lines.append(
+                "  version is a narrowing; the fuller shape again means this read was the short one."
             )
         elif payload["meter_fields_removed"]:
             lines.append(
@@ -1717,7 +1763,7 @@ def render_drift(payload):
             lines.append(
                 "  opencode 2.2.0 shape: no spend at all for a session that was billed."
             )
-        if payload["meter_fields_narrowed"]:
+        if payload["meter_fields_narrowed"] and payload["verdict"] != "narrowing_unconfirmed":
             lines.append(
                 "  A field that carries a price is still in the receipt, just not on every model:"
             )
@@ -1730,7 +1776,10 @@ def render_drift(payload):
             for row in payload["type_changed"]:
                 if row["path"] in payload["meter_fields_altered"]:
                     lines.append(f"    {row['path']}: {row['was']} -> {row['now']}")
-        if payload["narrowed"]:
+        if payload["narrowed"] and payload["verdict"] not in (
+            "narrowing_unconfirmed",
+            "removal_unconfirmed",
+        ):
             lines.append("")
             lines.append(
                 f"NARROWED ({len(payload['narrowed'])}) - still there, on fewer members than before"
@@ -1896,15 +1945,17 @@ def render_drift(payload):
     )
     lines.append("record stays short and nothing here can tell.")
     lines.append(
-        "LIMIT: a removal seen once across a version change is removal_unconfirmed, never a"
+        "LIMIT: a removal or a narrowing seen once across a version change is unconfirmed,"
     )
     lines.append(
-        "verdict - but a field that drops from SOME members of a family (a narrowing) at a"
+        "never a verdict - both need the same shape read twice at that version. On the"
     )
     lines.append(
-        "brand-new version is still named on the first read: this guard tests the path set,"
+        "same-version axis only a missing path waits: a narrowing there leaves the path set"
     )
-    lines.append("and a narrowing leaves that path set intact.")
+    lines.append(
+        "intact, so it is named on the first read and could be a half-written entry."
+    )
     lines.append(
         "LIMIT: a list that rolls over (a window of days) can lose a carrier because an old"
     )
