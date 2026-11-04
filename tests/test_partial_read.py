@@ -171,10 +171,17 @@ def test_a_different_shorter_read_does_not_count_as_confirmation(tmp_path):
     assert len(entry_of(store_file)["shape"]) == len(quotamirror.shape_of(full))
 
 
-def test_a_same_version_read_with_a_new_field_is_still_schema_changed(tmp_path):
-    """Guard: the rule is about subsets. A read that grew is a change, not a truncation."""
+def test_a_same_version_read_with_a_new_field_is_schema_changed(tmp_path):
+    """Guard: the rule is about subsets. A read that grew is a change, not a truncation.
+
+    Narrowed in r93: "a change" is only a supportable name once the record it grew
+    past came from more than one read. Against a single unconfirmed read the two
+    explanations - a vendor addition and a short first read - are the same picture,
+    and `tests/test_short_baseline.py` holds that case.
+    """
     full = receipt()
     read(tmp_path, full)
+    read(tmp_path, full)  # the same shape twice: the baseline is confirmed
 
     grown = dict(full)
     grown["newTotals"] = {"byDay": 1}

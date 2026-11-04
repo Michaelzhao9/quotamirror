@@ -116,7 +116,7 @@ def test_record_keeps_only_normalized_shape_under_a_path_digest(tmp_path):
     assert list(store["caches"]) == [quotamirror.path_identity(path)]
     entry = store["caches"][quotamirror.path_identity(path)]["versions"]["5/5"]
     assert entry["shape"] == quotamirror.shape_of(receipt(note=SENTINEL))
-    assert set(entry) == {"shape", "presence", "presence_lists", "at"}
+    assert set(entry) == {"shape", "presence", "presence_lists", "reads", "at"}
     assert "modelUsage.<model>.inputTokens" in entry["shape"]
 
 
@@ -132,7 +132,7 @@ def test_record_keeps_the_shape_and_no_value(tmp_path):
     store = quotamirror.load_store(store_file)
     entry = store["caches"][quotamirror.path_identity(path)]["versions"]["5/5"]
     assert entry["shape"] == quotamirror.shape_of(receipt(note=SENTINEL))
-    assert set(entry) == {"shape", "presence", "presence_lists", "at"}
+    assert set(entry) == {"shape", "presence", "presence_lists", "reads", "at"}
 
 
 def test_recording_the_same_version_twice_updates_one_entry(tmp_path):
@@ -216,7 +216,7 @@ def test_two_version_fields_that_disagree_are_reported_without_stored_state(tmp_
     )
     store = quotamirror.load_store(store_file)
     entry = store["caches"][quotamirror.path_identity(path)]["versions"]["5/4"]
-    assert set(entry) == {"shape", "presence", "presence_lists", "at"}
+    assert set(entry) == {"shape", "presence", "presence_lists", "reads", "at"}
     assert quotamirror.drift_report(store, path, receipt(version=5, dailyModelTokensVersion=4))["version_fields_disagree"] is True
 
 
@@ -515,6 +515,8 @@ def test_the_recorded_shape_carries_when_it_was_seen(tmp_path):
         "presence": quotamirror.shape_presence(receipt()),
         # schema 4: presence also counts list members, and says so
         "presence_lists": True,
+        # schema 6: one read is a record nobody has agreed with yet
+        "reads": 1,
         "at": "2026-11-01T00:00:00Z",
     }
 

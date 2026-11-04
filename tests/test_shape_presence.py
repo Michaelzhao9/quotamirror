@@ -110,7 +110,7 @@ def test_the_store_keeps_presence_counts_beside_the_shape(tmp_path):
         "versions"
     ]["5/5"]
     assert entry["presence"]["modelUsage.<model>.costUSD"] == [8, 9]
-    assert set(entry) == {"shape", "presence", "presence_lists", "at"}
+    assert set(entry) == {"shape", "presence", "presence_lists", "reads", "at"}
 
 
 def test_upgrading_a_schema_2_store_keeps_its_baseline(tmp_path):

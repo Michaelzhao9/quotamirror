@@ -1082,7 +1082,7 @@ def _shape_is_strict_subset(base, current):
     return all(base[path] == current[path] for path in current)
 
 
-STORE_SCHEMA = 5
+STORE_SCHEMA = 6
 
 
 
@@ -1122,7 +1122,7 @@ def _migrate_store(store):
     future version has to be compared against; a baseline without presence is
     still a valid shape baseline, it just cannot answer the newer question.
     """
-    if store.get("schema") not in (2, 3, 4, STORE_SCHEMA):
+    if store.get("schema") not in (2, 3, 4, 5, STORE_SCHEMA):
         return {"schema": STORE_SCHEMA, "caches": {}}
     store["schema"] = STORE_SCHEMA
     return store
@@ -1144,6 +1144,8 @@ def record_shape(store_path, cache_path, receipt, captured_at=None):
     stamp = captured_at or _utc_stamp()
     previous = versions.get(key) or {}
     digest = shape_digest(shape)
+    previous_digest = shape_digest(previous["shape"]) if previous.get("shape") else None
+    previous_reads = previous.get("reads")
     challenged = previous.get("pending_partial") or {}
     confirmed = challenged.get("shape_digest") == digest
 
@@ -1161,6 +1163,15 @@ def record_shape(store_path, cache_path, receipt, captured_at=None):
         versions.pop(key, None)
         versions[key] = previous
     else:
+        # How many reads have produced this exact shape at this version. One read is
+        # a record nobody has agreed with yet, which is why a later fuller read has
+        # to be reported as an ambiguity rather than as a vendor addition.
+        if confirmed:
+            reads = 2  # the challenge read and this one
+        elif previous_digest == digest:
+            reads = (previous_reads if isinstance(previous_reads, int) else 1) + 1
+        else:
+            reads = 1
         versions.pop(key, None)
         versions[key] = {
             "shape": shape,
@@ -1169,6 +1180,7 @@ def record_shape(store_path, cache_path, receipt, captured_at=None):
             # counts for keyed families only, and has to say so rather than imply
             # the list axis was measured.
             "presence_lists": True,
+            "reads": reads,
             "at": stamp,
         }
 
@@ -1362,6 +1374,8 @@ def within_version_report(versions, current, current_key, current_presence=None)
         "presence_axes_unmeasured": [],
         "same_as_recorded_at": None,
         "partial_read": None,
+        "short_baseline": None,
+        "baseline_reads": None,
         "confirmed_removal": False,
     }
     base = entry.get("shape")
@@ -1381,6 +1395,13 @@ def within_version_report(versions, current, current_key, current_presence=None)
     challenged = entry.get("pending_partial") or {}
     confirmed = challenged.get("shape_digest") == digest
     suspected = not confirmed and _shape_is_strict_subset(base, current)
+    reads = entry.get("reads")
+    # Grew past the record, changed nothing the record already had, and the record
+    # came from a single read. A vendor addition and a short first read are the same
+    # picture here, so neither name is allowed.
+    short_baseline = bool(
+        reads == 1 and diff["added"] and not diff["removed"] and not diff["type_changed"]
+    )
     payload.update(diff)
     payload.update(
         {
@@ -1389,6 +1410,7 @@ def within_version_report(versions, current, current_key, current_presence=None)
             "reason_text": None,
             "baseline_at": entry.get("at"),
             "fields_baseline": len(base),
+            "baseline_reads": reads,
             "same_as_recorded_at": entry.get("at")
             if diff["verdict"] == "unchanged"
             else None,
@@ -1412,6 +1434,19 @@ def within_version_report(versions, current, current_key, current_presence=None)
         payload["verdict"] = "possible_partial_read"
     if confirmed:
         payload["confirmed_removal"] = True
+    if short_baseline:
+        # The mirror case: one unconfirmed record, then a read that only has more.
+        # Recording the fuller shape is right - a truncation cannot grow past the
+        # record it truncated. Naming the difference a vendor addition is not.
+        payload["verdict"] = "possible_short_baseline"
+        payload["short_baseline"] = {
+            "shape_digest": digest,
+            "fields_baseline": len(base),
+            "fields_now": len(current),
+            "fields_unconfirmed": diff["added"],
+            "recorded_at": entry.get("at"),
+            "reads": reads,
+        }
     return payload
 
 
@@ -1450,6 +1485,7 @@ def drift_report(store, cache_path, receipt):
         versions, current, current_key, current_presence
     )
     payload["partial_read"] = payload["within_version"]["partial_read"]
+    payload["short_baseline"] = payload["within_version"]["short_baseline"]
     if not others:
         return payload
 
@@ -1491,10 +1527,15 @@ def drift_report(store, cache_path, receipt):
             "fields_baseline": len(base),
         }
     )
-    if payload["within_version"]["verdict"] == "possible_partial_read":
-        # The same read fed this axis. If the read itself is suspect, naming a
-        # vendor deletion from it would be the r89 defect stated across versions.
-        payload["verdict"] = "possible_partial_read"
+    within_verdict = payload["within_version"]["verdict"]
+    if within_verdict in ("possible_partial_read", "possible_short_baseline") and (
+        added or removed or type_changed or diff["narrowed"]
+    ):
+        # The same read fed this axis, and this axis has a difference of its own that
+        # the suspect record produced. Naming a vendor change from it would be the
+        # r89 defect stated across versions. A clean cross-version comparison is left
+        # alone: it rests on the other version's record, not on this one.
+        payload["verdict"] = within_verdict
     return payload
 
 
@@ -1559,7 +1600,32 @@ def render_drift(payload):
         )
         lines.append("")
         lines.append(f"VERDICT: {payload['verdict']}")
-        if payload["verdict"] == "possible_partial_read":
+        if payload["verdict"] == "possible_short_baseline":
+            part = payload.get("short_baseline") or {}
+            lines.append(
+                f"  this read holds {_fmt(part.get('fields_now', 0))} fields against the "
+                f"{_fmt(part.get('fields_baseline', 0))} recorded at version "
+                f"{payload['version_key']}, and changed nothing the record already had."
+            )
+            lines.append(
+                "  Fields appearing at an unchanged version are what a vendor addition looks"
+            )
+            lines.append(
+                "  like - and they are also what a single short read looks like once it is"
+            )
+            lines.append("  written down as this version's baseline. Only one read produced")
+            lines.append("  that record, so it cannot settle which one this is:")
+            for path in part.get("fields_unconfirmed") or []:
+                lines.append(f"  + {path} (unconfirmed)")
+            lines.append(
+                "  The fuller read is what gets recorded: a truncated read cannot grow past"
+            )
+            lines.append("  the record it truncated, so this one is strictly more information.")
+            lines.append(
+                "  Run drift again on the settled file - the same shape twice makes it a"
+            )
+            lines.append("  baseline a later change can be measured against.")
+        elif payload["verdict"] == "possible_partial_read":
             part = payload.get("partial_read") or {}
             lines.append(
                 f"  this read holds {_fmt(part.get('fields_now', 0))} of the "
@@ -1624,7 +1690,7 @@ def render_drift(payload):
             for path in payload["removed"]:
                 marker = "!" if path in payload["meter_fields_removed"] else " "
                 lines.append(f"  {marker} {path}")
-        if payload["added"]:
+        if payload["added"] and payload["verdict"] != "possible_short_baseline":
             lines.append("")
             lines.append(f"ADDED ({len(payload['added'])})")
             for path in payload["added"]:
@@ -1654,6 +1720,37 @@ def render_drift(payload):
             )
         elif within["verdict"] == "unchanged_shape_only":
             lines.extend(_presence_gap_lines(within["presence_axes_unmeasured"]))
+        elif within["verdict"] == "possible_short_baseline":
+            part = within["short_baseline"]
+            lines.append(
+                f"  this read holds {_fmt(part['fields_now'])} fields against the "
+                f"{_fmt(part['fields_baseline'])} recorded {when}, and changed nothing the"
+            )
+            lines.append("  record already had - it only has more.")
+            lines.append("")
+            lines.append(
+                "  Fields appearing at an unchanged version are what a vendor addition looks"
+            )
+            lines.append(
+                "  like. They are also what this tool looks like when its single earlier read"
+            )
+            lines.append(
+                "  was short. One unconfirmed record cannot separate those two, so nothing"
+            )
+            lines.append("  below is reported as added yet:")
+            for path in part["fields_unconfirmed"]:
+                lines.append(f"    + {path} (unconfirmed)")
+            lines.append("")
+            lines.append(
+                "  The fuller read becomes the baseline - it keeps every field and type the"
+            )
+            lines.append(
+                "  old one had, and a truncated read cannot grow past the record it truncated."
+            )
+            lines.append(
+                "  Run drift again: the same shape twice makes it a record, and only then is a"
+            )
+            lines.append("  difference measured against it a vendor change.")
         elif within["verdict"] == "possible_partial_read":
             part = within["partial_read"]
             lines.append(
@@ -1734,6 +1831,13 @@ def render_drift(payload):
     lines.append(
         "checked against, so a partial read there becomes that version's baseline untested."
     )
+    lines.append(
+        "A later fuller read at that version is then reported as possible_short_baseline, not"
+    )
+    lines.append(
+        "as a vendor addition - but if every read at that version is short the same way, the"
+    )
+    lines.append("record stays short and nothing here can tell.")
     lines.append(
         "LIMIT: a list that rolls over (a window of days) can lose a carrier because an old"
     )
