@@ -531,8 +531,12 @@ def test_a_within_version_change_is_visible_against_the_store_written_before_it(
 
     within = _within(payload)
     assert within["measurable"] is True
-    assert within["verdict"] == "meter_field_removed"
+    # 0.27.0: a single smaller read is evidence, not a verdict - it is also what a
+    # mid-write read looks like. The removal is named once the same shape is read
+    # twice (see tests/test_partial_read.py), so the first read stops here.
+    assert within["verdict"] == "possible_partial_read"
     assert within["meter_fields_removed"] == ["modelUsage.<model>.costUSD"]
+    assert within["partial_read"]["confirmed"] is False
     assert within["baseline_at"] == "2026-11-01T00:00:00Z"
     # the across-version axis is still unmeasured, and says so separately
     assert payload["verdict"] == "no_baseline"
@@ -599,6 +603,10 @@ def test_cli_second_run_names_a_meter_field_removed_without_a_version_change(tmp
     after = receipt()
     del after["modelUsage"]["claude-sonnet-4-5"]["costUSD"]
     cache.write_text(json.dumps(after), encoding="utf-8")
+    first = run_cli(["drift", "--path", str(cache), "--store", str(store)], cwd=tmp_path)
+    assert "possible_partial_read" in first.stdout
+
+    # two agreeing reads are what a half-written file cannot produce
     result = run_cli(["drift", "--path", str(cache), "--store", str(store)], cwd=tmp_path)
 
     assert result.returncode == 0, result.stderr

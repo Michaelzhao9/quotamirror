@@ -1058,7 +1058,32 @@ def shape_presence(receipt):
     return _shape_walk(receipt, "")[1]
 
 
-STORE_SCHEMA = 4
+def shape_digest(shape):
+    """A short identity for a field set, so a suspicion can be re-recognised.
+
+    Not reversible and not a shape: a pending read must not add a second copy of
+    the receipt's field names to the store just to be remembered.
+    """
+    payload = json.dumps(sorted(shape.items()), separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _shape_is_strict_subset(base, current):
+    """True when `current` holds fewer fields and none of the shared ones changed.
+
+    That is what a read of a half-written receipt looks like. It is also what a
+    vendor deleting a subtree looks like - one read cannot tell them apart, which
+    is why this only raises a suspicion and never a verdict.
+    """
+    if not base or not current:
+        return False
+    if not set(current) < set(base):
+        return False
+    return all(base[path] == current[path] for path in current)
+
+
+STORE_SCHEMA = 5
+
 
 
 def path_identity(path):
@@ -1097,7 +1122,7 @@ def _migrate_store(store):
     future version has to be compared against; a baseline without presence is
     still a valid shape baseline, it just cannot answer the newer question.
     """
-    if store.get("schema") not in (2, 3, STORE_SCHEMA):
+    if store.get("schema") not in (2, 3, 4, STORE_SCHEMA):
         return {"schema": STORE_SCHEMA, "caches": {}}
     store["schema"] = STORE_SCHEMA
     return store
@@ -1114,16 +1139,38 @@ def record_shape(store_path, cache_path, receipt, captured_at=None):
     store = _migrate_store(load_store(store_path))
     key, _ = _version_of(receipt)
     versions = store["caches"].setdefault(path_identity(cache_path), {}).setdefault("versions", {})
-    versions.pop(key, None)
-    versions[key] = {
-        "shape": shape_of(receipt),
-        "presence": shape_presence(receipt),
-        # schema 4: presence also counts list members. A schema-3 baseline has
-        # counts for keyed families only, and has to say so rather than imply
-        # the list axis was measured.
-        "presence_lists": True,
-        "at": captured_at or _utc_stamp(),
-    }
+    shape = shape_of(receipt)
+    presence = shape_presence(receipt)
+    stamp = captured_at or _utc_stamp()
+    previous = versions.get(key) or {}
+    digest = shape_digest(shape)
+    challenged = previous.get("pending_partial") or {}
+    confirmed = challenged.get("shape_digest") == digest
+
+    if not confirmed and _shape_is_strict_subset(previous.get("shape") or {}, shape):
+        # Shorter than the record at this same version. A vendor that dropped a
+        # field would have changed the version it declares; a read taken while the
+        # file was being written looks exactly like this. So the baseline stays and
+        # only the challenge is written - a second identical read is what turns it
+        # into a removal somebody can check.
+        previous["pending_partial"] = {
+            "shape_digest": digest,
+            "fields": len(shape),
+            "at": stamp,
+        }
+        versions.pop(key, None)
+        versions[key] = previous
+    else:
+        versions.pop(key, None)
+        versions[key] = {
+            "shape": shape,
+            "presence": presence,
+            # schema 4: presence also counts list members. A schema-3 baseline has
+            # counts for keyed families only, and has to say so rather than imply
+            # the list axis was measured.
+            "presence_lists": True,
+            "at": stamp,
+        }
 
     store_path.parent.mkdir(parents=True, exist_ok=True)
     handle, temporary = tempfile.mkstemp(prefix=f".{store_path.name}.", dir=store_path.parent)
@@ -1314,6 +1361,8 @@ def within_version_report(versions, current, current_key, current_presence=None)
         "list_presence_compared": False,
         "presence_axes_unmeasured": [],
         "same_as_recorded_at": None,
+        "partial_read": None,
+        "confirmed_removal": False,
     }
     base = entry.get("shape")
     if not base:
@@ -1328,6 +1377,10 @@ def within_version_report(versions, current, current_key, current_presence=None)
         list_presence_compared=bool(entry.get("presence_lists"))
         and current_presence is not None,
     )
+    digest = shape_digest(current)
+    challenged = entry.get("pending_partial") or {}
+    confirmed = challenged.get("shape_digest") == digest
+    suspected = not confirmed and _shape_is_strict_subset(base, current)
     payload.update(diff)
     payload.update(
         {
@@ -1341,6 +1394,24 @@ def within_version_report(versions, current, current_key, current_presence=None)
             else None,
         }
     )
+    if suspected or confirmed:
+        payload["partial_read"] = {
+            "confirmed": confirmed,
+            "shape_digest": digest,
+            "fields_baseline": len(base),
+            "fields_now": len(current),
+            "fields_unconfirmed": diff["removed"],
+            "priced_unconfirmed": diff["meter_fields_removed"],
+            "recorded_at": entry.get("at"),
+        }
+    if suspected:
+        # The shape axis saw fields disappear, but this read is shorter than the
+        # record at the same version, which is what a half-written file looks like.
+        # Refusing to name a verdict is the only honest report: the removal is not
+        # checkable until the same smaller shape is seen again.
+        payload["verdict"] = "possible_partial_read"
+    if confirmed:
+        payload["confirmed_removal"] = True
     return payload
 
 
@@ -1378,6 +1449,7 @@ def drift_report(store, cache_path, receipt):
     payload["within_version"] = within_version_report(
         versions, current, current_key, current_presence
     )
+    payload["partial_read"] = payload["within_version"]["partial_read"]
     if not others:
         return payload
 
@@ -1419,6 +1491,10 @@ def drift_report(store, cache_path, receipt):
             "fields_baseline": len(base),
         }
     )
+    if payload["within_version"]["verdict"] == "possible_partial_read":
+        # The same read fed this axis. If the read itself is suspect, naming a
+        # vendor deletion from it would be the r89 defect stated across versions.
+        payload["verdict"] = "possible_partial_read"
     return payload
 
 
@@ -1483,7 +1559,31 @@ def render_drift(payload):
         )
         lines.append("")
         lines.append(f"VERDICT: {payload['verdict']}")
-        if payload["meter_fields_removed"]:
+        if payload["verdict"] == "possible_partial_read":
+            part = payload.get("partial_read") or {}
+            lines.append(
+                f"  this read holds {_fmt(part.get('fields_now', 0))} of the "
+                f"{_fmt(part.get('fields_baseline', 0))} fields recorded at version "
+                f"{payload['version_key']}, and nothing it kept changed type."
+            )
+            lines.append(
+                "  A shorter but valid receipt is what a read taken while the file was being"
+            )
+            lines.append(
+                "  written looks like - and it is also what a vendor deleting a subtree looks"
+            )
+            lines.append(
+                "  like. Both axes below used this one read, so neither can name a deletion"
+            )
+            lines.append("  from it. The evidence, not yet a verdict:")
+            for path in part.get("fields_unconfirmed") or []:
+                marker = "!" if path in (part.get("priced_unconfirmed") or []) else " "
+                lines.append(f"  {marker} {path} (unconfirmed)")
+            lines.append(
+                "  Run drift again on the settled file: the same smaller shape twice is a"
+            )
+            lines.append("  removal, the full shape again means this read was the partial one.")
+        elif payload["meter_fields_removed"]:
             lines.append(
                 f"  {len(payload['meter_fields_removed'])} removed field(s) carry a price "
                 "(marked ! below):"
@@ -1554,6 +1654,32 @@ def render_drift(payload):
             )
         elif within["verdict"] == "unchanged_shape_only":
             lines.extend(_presence_gap_lines(within["presence_axes_unmeasured"]))
+        elif within["verdict"] == "possible_partial_read":
+            part = within["partial_read"]
+            lines.append(
+                f"  baseline kept ({_fmt(part['fields_baseline'])} fields, recorded {when});"
+                f" this read holds {_fmt(part['fields_now'])}."
+            )
+            lines.append(
+                "  A valid receipt missing a whole subtree is what a read taken while the file"
+            )
+            lines.append(
+                "  was being written looks like. It is also what a vendor deletion looks like,"
+            )
+            lines.append(
+                "  and one read cannot separate the two - so the baseline was not replaced by"
+            )
+            lines.append("  this one, and nothing below is reported as removed yet:")
+            for path in part["fields_unconfirmed"]:
+                marker = "!" if path in part["priced_unconfirmed"] else " "
+                lines.append(f"    {marker} {path} (unconfirmed)")
+            lines.append("")
+            lines.append(
+                "  Run drift again on the settled file. The same smaller shape twice makes the"
+            )
+            lines.append(
+                "  removal real; the full shape again makes this read the partial one."
+            )
         elif within["meter_fields_removed"]:
             lines.append(
                 "  a field that carried a price was removed WITHOUT a version change:"
@@ -1582,6 +1708,12 @@ def render_drift(payload):
             )
             for path in within["removed"]:
                 lines.append(f"    - {path}")
+        if within.get("confirmed_removal"):
+            lines.append("")
+            lines.append(
+                "  This smaller shape has now been read twice at this version, so it is recorded:"
+            )
+            lines.append("  two agreeing reads are what a half-written file cannot produce.")
         if within["verdict"] != "unchanged":
             lines.append("")
             lines.append(
@@ -1596,6 +1728,12 @@ def render_drift(payload):
         "meaning (a unit, a currency), or one that stays present and always 0, is invisible here."
     )
     lines.append("LIMIT: no values are stored - only paths, type names and presence counts.")
+    lines.append(
+        "LIMIT: the first read at a brand-new version has no same-version record to be"
+    )
+    lines.append(
+        "checked against, so a partial read there becomes that version's baseline untested."
+    )
     lines.append(
         "LIMIT: a list that rolls over (a window of days) can lose a carrier because an old"
     )
