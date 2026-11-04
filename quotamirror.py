@@ -1480,6 +1480,7 @@ def drift_report(store, cache_path, receipt):
         "presence_compared": False,
         "list_presence_compared": False,
         "presence_axes_unmeasured": [],
+        "cross_version_unconfirmed": None,
     }
     payload["within_version"] = within_version_report(
         versions, current, current_key, current_presence
@@ -1536,6 +1537,36 @@ def drift_report(store, cache_path, receipt):
         # r89 defect stated across versions. A clean cross-version comparison is left
         # alone: it rests on the other version's record, not on this one.
         payload["verdict"] = within_verdict
+    # The upgrade case: version A has a record, version B was just published, and
+    # this is the first read at B. A removal-only difference here cannot be told
+    # from a read taken while the file was being rewritten - and the within-version
+    # axis has nothing at B to check it against. Naming a vendor deletion from that
+    # one read would be the r89 defect stated across versions. The paths are
+    # reported unconfirmed, and the read is still recorded: the same smaller shape
+    # read twice at B is what makes it a removal (test_cross_version_removal).
+    if (
+        within_verdict not in ("possible_partial_read", "possible_short_baseline")
+        and removed
+        and not added
+        and not type_changed
+        and not diff["narrowed"]
+    ):
+        entry_here = versions.get(current_key) or {}
+        seen_here = bool(entry_here.get("shape")) and shape_digest(
+            entry_here["shape"]
+        ) == shape_digest(current)
+        if not seen_here:
+            payload["verdict"] = "removal_unconfirmed"
+            payload["cross_version_unconfirmed"] = {
+                "version_key": current_key,
+                "baseline_version_key": baseline_key,
+                "baseline_at": baseline.get("at"),
+                "fields_baseline": len(base),
+                "fields_now": len(current),
+                "fields_unconfirmed": removed,
+                "priced_unconfirmed": meter_removed,
+                "reads_at_current": entry_here.get("reads"),
+            }
     return payload
 
 
@@ -1649,6 +1680,32 @@ def render_drift(payload):
                 "  Run drift again on the settled file: the same smaller shape twice is a"
             )
             lines.append("  removal, the full shape again means this read was the partial one.")
+        elif payload["verdict"] == "removal_unconfirmed":
+            part = payload.get("cross_version_unconfirmed") or {}
+            lines.append(
+                f"  this is the first read at version {part.get('version_key')}. It holds "
+                f"{_fmt(part.get('fields_now', 0))} of the"
+            )
+            lines.append(
+                f"  {_fmt(part.get('fields_baseline', 0))} fields recorded at version "
+                f"{part.get('baseline_version_key')}, and nothing it kept changed type."
+            )
+            lines.append(
+                "  A vendor that removed a subtree and a read taken while the file was being"
+            )
+            lines.append(
+                "  rewritten produce the same picture in one read, and this version has no"
+            )
+            lines.append("  earlier record to settle it. So no deletion is named here:")
+            for path in part.get("fields_unconfirmed") or []:
+                marker = "!" if path in (part.get("priced_unconfirmed") or []) else " "
+                lines.append(f"  {marker} {path} (unconfirmed)")
+            lines.append(
+                "  Run drift again on the settled file: the same smaller shape twice at this"
+            )
+            lines.append(
+                "  version is a removal; the fuller shape again means this read was the short one."
+            )
         elif payload["meter_fields_removed"]:
             lines.append(
                 f"  {len(payload['meter_fields_removed'])} removed field(s) carry a price "
@@ -1838,6 +1895,16 @@ def render_drift(payload):
         "as a vendor addition - but if every read at that version is short the same way, the"
     )
     lines.append("record stays short and nothing here can tell.")
+    lines.append(
+        "LIMIT: a removal seen once across a version change is removal_unconfirmed, never a"
+    )
+    lines.append(
+        "verdict - but a field that drops from SOME members of a family (a narrowing) at a"
+    )
+    lines.append(
+        "brand-new version is still named on the first read: this guard tests the path set,"
+    )
+    lines.append("and a narrowing leaves that path set intact.")
     lines.append(
         "LIMIT: a list that rolls over (a window of days) can lose a carrier because an old"
     )

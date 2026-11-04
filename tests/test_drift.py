@@ -409,6 +409,9 @@ def test_first_run_says_drift_is_unmeasurable_and_records_the_shape(tmp_path):
 
 
 def test_second_version_names_the_removed_meter_field(tmp_path):
+    # The removal must be seen twice: the first read at a new version is
+    # `removal_unconfirmed`, because a vendor deletion and a half-written file are
+    # the same picture in one read. See tests/test_cross_version_removal.py.
     cache = tmp_path / "stats-cache.json"
     store = tmp_path / "shapes.json"
     cache.write_text(json.dumps(receipt()), encoding="utf-8")
@@ -417,6 +420,10 @@ def test_second_version_names_the_removed_meter_field(tmp_path):
     newer = receipt(version=6, dailyModelTokensVersion=6)
     del newer["modelUsage"]["claude-sonnet-4-5"]["costUSD"]
     cache.write_text(json.dumps(newer), encoding="utf-8")
+    first = run_cli(["drift", "--path", str(cache), "--store", str(store)], cwd=tmp_path)
+    assert first.returncode == 0, first.stderr
+    assert "removal_unconfirmed" in first.stdout
+
     result = run_cli(["drift", "--path", str(cache), "--store", str(store)], cwd=tmp_path)
 
     assert result.returncode == 0, result.stderr
@@ -482,6 +489,9 @@ def test_a_removed_meter_field_is_listed_once_not_twice(tmp_path):
     newer = receipt(version=6, dailyModelTokensVersion=6)
     del newer["modelUsage"]["claude-sonnet-4-5"]["costUSD"]
     cache.write_text(json.dumps(newer), encoding="utf-8")
+    # twice: the first read at the new version is unconfirmed (see
+    # tests/test_cross_version_removal.py), so the naming happens on the second
+    run_cli(["drift", "--path", str(cache), "--store", str(store)], cwd=tmp_path)
 
     result = run_cli(["drift", "--path", str(cache), "--store", str(store)], cwd=tmp_path)
 
