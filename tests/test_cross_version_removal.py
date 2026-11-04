@@ -217,4 +217,6 @@ def test_the_printed_report_after_the_second_read_names_the_removal(tmp_path):
     )
 
     assert "VERDICT: meter_field_removed" in text
-    assert "removal_unconfirmed" not in text
+    # The LIMIT paragraph names removal_unconfirmed as a thing the tool can say, so
+    # only the verdict line is checked here, not the whole page.
+    assert "VERDICT: removal_unconfirmed" not in text
