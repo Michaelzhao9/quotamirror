@@ -4,6 +4,13 @@ A local, read-only auditor for AI-agent usage receipts.
 
 Usage meters often expose several totals for the same activity: per-model totals, per-day rollups, running counters, deltas, and repeated transcript records. `quotamirror` compares those views, names their accounting basis, and refuses to turn missing prices or incompatible windows into a plausible-looking bill.
 
+## What it reads
+
+By default the receipt commands open Claude Code's local usage cache at `~/.claude/stats-cache.json`
+(per-model totals, per-day rollups, counters and session/message counts).
+`--claude-transcripts` adds the JSONL transcripts under `~/.claude/projects`, and `loop` / `nested`
+read that transcript store instead of the cache. Nothing else is read, and nothing is written.
+
 ## Why
 
 A receipt can be syntactically valid and still be misleading:
