@@ -1318,6 +1318,36 @@ def _narrowed_rows(base, current, base_presence, current_presence):
     return rows
 
 
+def _regained_rows(base, current, base_presence, current_presence):
+    """Fields on MORE family members than the record had.
+
+    The mirror of a narrowing, and the only way a narrowing is ever undone: the
+    record said a field had lost a carrier, and this read has it back. A family
+    that grew on its own is not this - a new model arriving with the field raises
+    both counts at once, and calling that "one carrier returned" would invent a
+    reversal. So a row only counts while the family size is the same on both
+    sides; a changed size is reported by the shape and by nothing here.
+    """
+    if not base_presence or not current_presence:
+        return []
+    rows = []
+    for path in sorted(set(base) & set(current)):
+        was = base_presence.get(path)
+        now = current_presence.get(path)
+        if not was or not now:
+            continue
+        if now[0] > was[0] and now[1] == was[1]:
+            rows.append(
+                {
+                    "path": path,
+                    "family": _family_of(path),
+                    "was": list(was),
+                    "now": list(now),
+                }
+            )
+    return rows
+
+
 def _narrowing_digest(rows):
     """Identity of one narrowing reading: which paths, which two counts.
 
@@ -1339,6 +1369,7 @@ def _shape_diff(
     current_presence=None,
     presence_compared=False,
     list_presence_compared=None,
+    detect_regain=False,
 ):
     """What changed between two shapes. Used by both drift axes."""
     if list_presence_compared is None:
@@ -1354,6 +1385,15 @@ def _shape_diff(
     meter_altered = [row["path"] for row in type_changed if _is_meter_path(row["path"])]
     narrowed = _narrowed_rows(base, current, base_presence, current_presence)
     meter_narrowed = [row["path"] for row in narrowed if _is_meter_path(row["path"])]
+    # Only the same-version axis asks for this: a regain is a statement about the
+    # record this run has at THIS version, and the cross-version axis has no
+    # policy for it yet (README, LIMIT).
+    regained = (
+        _regained_rows(base, current, base_presence, current_presence)
+        if detect_regain
+        else []
+    )
+    meter_regained = [row["path"] for row in regained if _is_meter_path(row["path"])]
     if meter_removed:
         verdict = "meter_field_removed"
     elif meter_altered:
@@ -1362,6 +1402,10 @@ def _shape_diff(
         verdict = "meter_field_narrowed"
     elif narrowed:
         verdict = "field_narrowed"
+    elif meter_regained:
+        verdict = "meter_field_regained"
+    elif regained:
+        verdict = "field_regained"
     elif removed or added or type_changed:
         verdict = "schema_changed"
     elif not (presence_compared and list_presence_compared):
@@ -1385,6 +1429,8 @@ def _shape_diff(
         "meter_fields_altered": meter_altered,
         "narrowed": narrowed,
         "meter_fields_narrowed": meter_narrowed,
+        "regained": regained,
+        "meter_fields_regained": meter_regained,
         "presence_compared": presence_compared,
         "list_presence_compared": list_presence_compared,
         "presence_axes_unmeasured": unmeasured,
@@ -1420,6 +1466,8 @@ def within_version_report(versions, current, current_key, current_presence=None)
         "meter_fields_altered": [],
         "narrowed": [],
         "meter_fields_narrowed": [],
+        "regained": [],
+        "meter_fields_regained": [],
         "presence_compared": False,
         "list_presence_compared": False,
         "presence_axes_unmeasured": [],
@@ -1430,6 +1478,7 @@ def within_version_report(versions, current, current_key, current_presence=None)
         "confirmed_removal": False,
         "possible_narrowing": None,
         "confirmed_narrowing": False,
+        "reversed_narrowing_at": None,
     }
     base = entry.get("shape")
     if not base:
@@ -1443,6 +1492,7 @@ def within_version_report(versions, current, current_key, current_presence=None)
         presence_compared=base_presence is not None and current_presence is not None,
         list_presence_compared=bool(entry.get("presence_lists"))
         and current_presence is not None,
+        detect_regain=True,
     )
     digest = shape_digest(current)
     challenged = entry.get("pending_partial") or {}
@@ -1469,6 +1519,11 @@ def within_version_report(versions, current, current_key, current_presence=None)
             else None,
         }
     )
+    if diff["regained"]:
+        # A record can be narrowed without having been confirmed twice (an older
+        # baseline from before r100), so this stamp is optional rather than
+        # required; when it exists it names the sentence this read contradicts.
+        payload["reversed_narrowing_at"] = entry.get("narrowing_confirmed_at")
     if suspected or confirmed:
         payload["partial_read"] = {
             "confirmed": confirmed,
@@ -1573,6 +1628,8 @@ def drift_report(store, cache_path, receipt):
         "meter_fields_altered": [],
         "narrowed": [],
         "meter_fields_narrowed": [],
+        "regained": [],
+        "meter_fields_regained": [],
         "presence_compared": False,
         "list_presence_compared": False,
         "presence_axes_unmeasured": [],
@@ -1618,6 +1675,8 @@ def drift_report(store, cache_path, receipt):
             "meter_fields_altered": meter_altered,
             "narrowed": diff["narrowed"],
             "meter_fields_narrowed": diff["meter_fields_narrowed"],
+            "regained": diff["regained"],
+            "meter_fields_regained": diff["meter_fields_regained"],
             "presence_compared": diff["presence_compared"],
             "list_presence_compared": diff["list_presence_compared"],
             "presence_axes_unmeasured": diff["presence_axes_unmeasured"],
@@ -1674,6 +1733,20 @@ def drift_report(store, cache_path, receipt):
                 "reads_at_current": entry_here.get("reads"),
             }
     return payload
+
+
+def _regain_block(rows, priced):
+    """Header plus one line per regained field, shared by both render paths."""
+    lines = [
+        f"REGAINED ({len(rows)}) - the record had fewer carriers than this read does"
+    ]
+    for row in rows:
+        marker = "!" if row["path"] in priced else " "
+        lines.append(
+            f"  {marker} {row['path']}: {row['now'][0]} of {row['now'][1]} "
+            f"{_family_noun(row['family'])} (was {row['was'][0]} of {row['was'][1]})"
+        )
+    return lines
 
 
 def _presence_gap_lines(unmeasured):
@@ -2030,6 +2103,28 @@ def render_drift(payload):
                     f"    {marker} {row['path']}: {row['now'][0]} of {row['now'][1]} "
                     f"{_family_noun(row['family'])} (was {row['was'][0]} of {row['was'][1]})"
                 )
+        elif within["regained"]:
+            when_record = within.get("reversed_narrowing_at")
+            lines.extend(_regain_block(within["regained"], within["meter_fields_regained"]))
+            lines.append("")
+            if when_record:
+                lines.append(
+                    f"  The narrowing that made this the record was confirmed at {when_record}:"
+                )
+                lines.append(
+                    "  the field lost a carrier on a second agreeing read. This read has it back."
+                )
+            else:
+                lines.append(
+                    "  The record had lost this carrier; this read has it again. Nothing here"
+                )
+                lines.append("  says when it came back.")
+            lines.append(
+                "  A stale copy of the older bytes and a record that was simply wrong look the"
+            )
+            lines.append(
+                "  same from here, so the return is not attributed to the vendor."
+            )
         else:
             if within["meter_fields_altered"]:
                 lines.append("  a field that carries a price changed type, same version:")
@@ -2042,6 +2137,22 @@ def render_drift(payload):
             )
             for path in within["removed"]:
                 lines.append(f"    - {path}")
+        if within["regained"] and within["verdict"] not in (
+            "meter_field_regained",
+            "field_regained",
+        ):
+            # The dispatch above gave the screen to a removal, a type change or a
+            # guard. A presence gain is still a measured fact about this record and
+            # must not vanish because a bigger verdict took the paragraph.
+            lines.append("")
+            lines.extend(_regain_block(within["regained"], within["meter_fields_regained"]))
+            if within.get("reversed_narrowing_at"):
+                lines.append(
+                    "  Contradicts the narrowing confirmed at "
+                    f"{within['reversed_narrowing_at']}."
+                )
+            else:
+                lines.append("  The record had lost this carrier; this read has it again.")
         if within.get("confirmed_removal"):
             lines.append("")
             lines.append(
@@ -2103,6 +2214,15 @@ def render_drift(payload):
     )
     lines.append("cannot tell those two apart. Two lists under different keys also fold into")
     lines.append("one count, so '2 of 8' can mean 1 of 3 plus 1 of 5.")
+    lines.append(
+        "LIMIT: a carrier that comes back is named only against this version's own record."
+    )
+    lines.append(
+        "Across a version change it is reported as part of the ordinary difference, and a"
+    )
+    lines.append(
+        "stale copy of the older bytes looks exactly like a return that happened just now."
+    )
     return "\n".join(lines) + "\n"
 
 
