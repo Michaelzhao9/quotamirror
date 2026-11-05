@@ -62,6 +62,12 @@ def test_a_field_dropped_from_one_day_is_a_narrowed_field(tmp_path):
     fewer = receipt(drop_field=(1, "toolCallCount"))
     path.write_text(json.dumps(fewer), encoding="utf-8")
 
+    first = quotamirror.drift_report(quotamirror.load_store(store_file), path, fewer)
+    # The list axis is ambiguous on one read for the same reason the map axis is: an
+    # incrementally written array looks like a narrowed field.
+    assert within_of(first)["verdict"] == "possible_narrowing"
+    quotamirror.record_shape(store_file, path, fewer)
+
     payload = quotamirror.drift_report(quotamirror.load_store(store_file), path, fewer)
     within = within_of(payload)
 
@@ -75,6 +81,7 @@ def test_a_field_dropped_from_one_day_is_a_narrowed_field(tmp_path):
             "now": [2, 3],
         }
     ]
+    assert within["removed"] == []
 
 
 def test_a_list_that_grew_without_the_field_removes_no_carrier(tmp_path):
@@ -146,6 +153,8 @@ def test_the_rendered_narrowing_names_the_list(tmp_path):
     path, store_file = recorded_store(tmp_path, receipt())
     fewer = receipt(drop_field=(1, "toolCallCount"))
     path.write_text(json.dumps(fewer), encoding="utf-8")
+    quotamirror.drift_report(quotamirror.load_store(store_file), path, fewer)
+    quotamirror.record_shape(store_file, path, fewer)
 
     text = quotamirror.render_drift(
         quotamirror.drift_report(quotamirror.load_store(store_file), path, fewer)

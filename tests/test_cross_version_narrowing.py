@@ -149,10 +149,12 @@ def test_a_read_that_both_removes_and_narrows_reports_both_as_unconfirmed(tmp_pa
     ]
 
 
-def test_a_narrowing_read_at_the_same_version_is_still_measured_there(tmp_path):
-    # Not part of this guard: with one version on disk the same-version axis is
-    # the only record, and a narrowing leaves the path set intact, so that axis
-    # still names it from one read. Recorded as a limit, not fixed here.
+def test_a_narrowing_read_at_the_same_version_is_measured_but_not_named_yet(tmp_path):
+    # The other half of the upgrade case: with one version on disk the same-version
+    # axis is the only record. A narrowing leaves the path set intact, so that axis
+    # used to name it from one read. It now keeps the older counts as the baseline
+    # and reports `possible_narrowing` (see tests/test_within_narrowing.py); the same
+    # narrower counts read twice are what name it.
     path, store = store_at(tmp_path, receipt(version=5))
 
     payload = quotamirror.drift_report(
@@ -160,7 +162,7 @@ def test_a_narrowing_read_at_the_same_version_is_still_measured_there(tmp_path):
     )
 
     assert payload["verdict"] == "no_baseline"
-    assert payload["within_version"]["verdict"] == "meter_field_narrowed"
+    assert payload["within_version"]["verdict"] == "possible_narrowing"
     assert payload.get("cross_version_unconfirmed") is None
 
 

@@ -1148,6 +1148,17 @@ def record_shape(store_path, cache_path, receipt, captured_at=None):
     previous_reads = previous.get("reads")
     challenged = previous.get("pending_partial") or {}
     confirmed = challenged.get("shape_digest") == digest
+    previous_shape = previous.get("shape") or {}
+    # A read that keeps every path and type but carries fewer members of a family.
+    # Nothing on the shape axis can see it - which is why it needs its own challenge.
+    narrowed_now = _narrowed_rows(
+        previous_shape, shape, previous.get("presence"), presence
+    )
+    narrowing_only = (
+        bool(narrowed_now)
+        and set(previous_shape) == set(shape)
+        and all(previous_shape[p] == shape[p] for p in shape)
+    )
 
     if not confirmed and _shape_is_strict_subset(previous.get("shape") or {}, shape):
         # Shorter than the record at this same version. A vendor that dropped a
@@ -1162,6 +1173,32 @@ def record_shape(store_path, cache_path, receipt, captured_at=None):
         }
         versions.pop(key, None)
         versions[key] = previous
+    elif narrowing_only:
+        # Every path and type survived; only the number of family members carrying
+        # them fell. A receipt being written incrementally looks exactly like this
+        # (two of three model objects emitted), so the older presence stays the
+        # baseline and only the challenge is written. The same narrower counts read
+        # twice are what become the record.
+        pending_narrowing = previous.get("pending_narrowed") or {}
+        narrowing_digest = _narrowing_digest(narrowed_now)
+        if pending_narrowing.get("presence_digest") == narrowing_digest:
+            versions.pop(key, None)
+            versions[key] = {
+                "shape": shape,
+                "presence": presence,
+                "presence_lists": True,
+                "reads": 2,
+                "at": stamp,
+                "narrowing_confirmed_at": stamp,
+            }
+        else:
+            previous["pending_narrowed"] = {
+                "presence_digest": narrowing_digest,
+                "rows": len(narrowed_now),
+                "at": stamp,
+            }
+            versions.pop(key, None)
+            versions[key] = previous
     else:
         # How many reads have produced this exact shape at this version. One read is
         # a record nobody has agreed with yet, which is why a later fuller read has
@@ -1281,6 +1318,20 @@ def _narrowed_rows(base, current, base_presence, current_presence):
     return rows
 
 
+def _narrowing_digest(rows):
+    """Identity of one narrowing reading: which paths, which two counts.
+
+    A narrowing leaves the path set - and so the shape digest - intact, so the
+    shape axis cannot tell one narrowing reading from another. The counts are the
+    only thing that changed, which is exactly what has to be recognised twice.
+    """
+    joined = "|".join(
+        f"{row['path']}:{row['was'][0]}/{row['was'][1]}->{row['now'][0]}/{row['now'][1]}"
+        for row in sorted(rows, key=lambda row: row["path"])
+    )
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:12]
+
+
 def _shape_diff(
     base,
     current,
@@ -1377,6 +1428,8 @@ def within_version_report(versions, current, current_key, current_presence=None)
         "short_baseline": None,
         "baseline_reads": None,
         "confirmed_removal": False,
+        "possible_narrowing": None,
+        "confirmed_narrowing": False,
     }
     base = entry.get("shape")
     if not base:
@@ -1423,7 +1476,13 @@ def within_version_report(versions, current, current_key, current_presence=None)
             "fields_baseline": len(base),
             "fields_now": len(current),
             "fields_unconfirmed": diff["removed"],
-            "priced_unconfirmed": diff["meter_fields_removed"],
+            "priced_unconfirmed": diff["meter_fields_removed"]
+            + [
+                row["path"]
+                for row in diff["narrowed"]
+                if _is_meter_path(row["path"])
+                and row["path"] not in diff["meter_fields_removed"]
+            ],
             "recorded_at": entry.get("at"),
         }
     if suspected:
@@ -1447,6 +1506,43 @@ def within_version_report(versions, current, current_key, current_presence=None)
             "recorded_at": entry.get("at"),
             "reads": reads,
         }
+    narrowed_rows = diff["narrowed"]
+    narrowing_only = (
+        bool(narrowed_rows)
+        and not diff["added"]
+        and not diff["removed"]
+        and not diff["type_changed"]
+    )
+    challenged_narrowing = entry.get("pending_narrowed") or {}
+    confirmed_narrowing = (
+        narrowing_only
+        and challenged_narrowing.get("presence_digest")
+        == _narrowing_digest(narrowed_rows)
+    )
+    if narrowing_only and not confirmed_narrowing:
+        # Every path and type is still there; only the family counts fell. That is
+        # what a receipt written incrementally looks like as well as what a vendor
+        # narrowing a field looks like, and one read cannot separate them. The
+        # baseline keeps the older counts; the same narrower counts read again are
+        # what make it a narrowing.
+        payload["verdict"] = "possible_narrowing"
+        priced = list(diff["meter_fields_removed"])
+        for row in narrowed_rows:
+            if _is_meter_path(row["path"]) and row["path"] not in priced:
+                priced.append(row["path"])
+        payload["possible_narrowing"] = {
+            "rows": narrowed_rows,
+            "priced_unconfirmed": priced,
+            "fields_baseline": len(base),
+            "fields_now": len(current),
+            "recorded_at": entry.get("at"),
+            "reads": reads,
+        }
+    elif confirmed_narrowing:
+        # These exact counts were already read once at this version and the read
+        # was recorded as a suspicion. A second identical reading is what an
+        # incrementally written file cannot produce.
+        payload["confirmed_narrowing"] = True
     return payload
 
 
@@ -1529,9 +1625,11 @@ def drift_report(store, cache_path, receipt):
         }
     )
     within_verdict = payload["within_version"]["verdict"]
-    if within_verdict in ("possible_partial_read", "possible_short_baseline") and (
-        added or removed or type_changed or diff["narrowed"]
-    ):
+    if within_verdict in (
+        "possible_partial_read",
+        "possible_short_baseline",
+        "possible_narrowing",
+    ) and (added or removed or type_changed or diff["narrowed"]):
         # The same read fed this axis, and this axis has a difference of its own that
         # the suspect record produced. Naming a vendor change from it would be the
         # r89 defect stated across versions. A clean cross-version comparison is left
@@ -1763,7 +1861,10 @@ def render_drift(payload):
             lines.append(
                 "  opencode 2.2.0 shape: no spend at all for a session that was billed."
             )
-        if payload["meter_fields_narrowed"] and payload["verdict"] != "narrowing_unconfirmed":
+        if payload["meter_fields_narrowed"] and payload["verdict"] not in (
+            "narrowing_unconfirmed",
+            "possible_narrowing",
+        ):
             lines.append(
                 "  A field that carries a price is still in the receipt, just not on every model:"
             )
@@ -1779,6 +1880,7 @@ def render_drift(payload):
         if payload["narrowed"] and payload["verdict"] not in (
             "narrowing_unconfirmed",
             "removal_unconfirmed",
+            "possible_narrowing",
         ):
             lines.append("")
             lines.append(
@@ -1883,6 +1985,35 @@ def render_drift(payload):
             lines.append(
                 "  removal real; the full shape again makes this read the partial one."
             )
+        elif within["verdict"] == "possible_narrowing":
+            part = within["possible_narrowing"]
+            lines.append(
+                f"  baseline kept ({_fmt(part['fields_baseline'])} fields, recorded {when});"
+                " every path and type is still here."
+            )
+            lines.append(
+                "  What fell is the number of family members carrying them. A vendor"
+                " narrowing a field and a receipt read while it was being written - two of"
+            )
+            lines.append(
+                "  three model objects emitted - produce this same picture in one read, so"
+                " no narrowing is named here:"
+            )
+            for row in part["rows"]:
+                marker = "!" if row["path"] in part["priced_unconfirmed"] else " "
+                lines.append(
+                    f"    {marker} {row['path']}: {row['now'][0]} of {row['now'][1]} "
+                    f"{_family_noun(row['family'])}"
+                    f" (was {row['was'][0]} of {row['was'][1]}) (unconfirmed)"
+                )
+            lines.append("")
+            lines.append(
+                "  Run drift again on the settled file: the same narrower counts twice make"
+            )
+            lines.append(
+                "  the narrowing the record; the older counts again mean this read was the"
+            )
+            lines.append("  short one.")
         elif within["meter_fields_removed"]:
             lines.append(
                 "  a field that carried a price was removed WITHOUT a version change:"
@@ -1917,6 +2048,14 @@ def render_drift(payload):
                 "  This smaller shape has now been read twice at this version, so it is recorded:"
             )
             lines.append("  two agreeing reads are what a half-written file cannot produce.")
+        if within.get("confirmed_narrowing"):
+            lines.append("")
+            lines.append(
+                "  These narrower counts have now been read twice at this version, so they"
+            )
+            lines.append(
+                "  are the record: an incrementally written file cannot produce them twice."
+            )
         if within["verdict"] != "unchanged":
             lines.append("")
             lines.append(
@@ -1948,13 +2087,13 @@ def render_drift(payload):
         "LIMIT: a removal or a narrowing seen once across a version change is unconfirmed,"
     )
     lines.append(
-        "never a verdict - both need the same shape read twice at that version. On the"
+        "never a verdict - both need the same shape read twice at that version. When the"
     )
     lines.append(
-        "same-version axis only a missing path waits: a narrowing there leaves the path set"
+        "version does not change, a narrowing is confirmed on the counts instead (the path"
     )
     lines.append(
-        "intact, so it is named on the first read and could be a half-written entry."
+        "set does not move): moving counts are a fresh suspicion every time, not a verdict."
     )
     lines.append(
         "LIMIT: a list that rolls over (a window of days) can lose a carrier because an old"

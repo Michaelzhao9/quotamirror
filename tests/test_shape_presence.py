@@ -74,6 +74,12 @@ def test_a_field_dropped_from_one_model_is_a_narrowed_meter_not_unchanged(tmp_pa
     fewer = multi(drop_field=("model-3", "costUSD"))
     path.write_text(json.dumps(fewer), encoding="utf-8")
 
+    first = quotamirror.drift_report(quotamirror.load_store(store_file), path, fewer)
+    # One read cannot separate a vendor narrowing from an incrementally written
+    # receipt, so the first read keeps the baseline and only reports the counts.
+    assert first["within_version"]["verdict"] == "possible_narrowing"
+    quotamirror.record_shape(store_file, path, fewer)
+
     payload = quotamirror.drift_report(quotamirror.load_store(store_file), path, fewer)
     within = payload["within_version"]
 
@@ -181,6 +187,11 @@ def test_the_rendered_drift_names_how_many_models_kept_the_field(tmp_path):
     path, store_file = recorded_store(tmp_path, multi())
     fewer = multi(drop_field=("model-3", "costUSD"))
     path.write_text(json.dumps(fewer), encoding="utf-8")
+    # Named only after the same narrower counts have been read twice (see
+    # tests/test_within_narrowing.py); the rendering of the confirmed read is what
+    # this test is about.
+    quotamirror.drift_report(quotamirror.load_store(store_file), path, fewer)
+    quotamirror.record_shape(store_file, path, fewer)
 
     text = quotamirror.render_drift(
         quotamirror.drift_report(quotamirror.load_store(store_file), path, fewer)
