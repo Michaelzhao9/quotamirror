@@ -4561,8 +4561,28 @@ def render_nested(payload):
 
 
 def load_cache(path):
-    with open(path, "r", encoding="utf-8") as handle:
-        cache = json.load(handle)
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    if not raw.strip():
+        raise ValueError(
+            f"{path} is empty ({len(raw)} bytes) - a receipt that was never written, "
+            "or one that is being rewritten right now"
+        )
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError(
+            f"{path} is not UTF-8 text (byte 0x{raw[exc.start]:02x} at offset {exc.start}, "
+            f"{len(raw)} bytes read)"
+        ) from None
+    try:
+        cache = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"{path} is not valid JSON ({exc.msg} at line {exc.lineno} column {exc.colno}, "
+            f"{len(raw)} bytes read) - a receipt caught mid-write looks like this, and "
+            "nothing is claimed about the tokens it would have held"
+        ) from None
     if not isinstance(cache, dict) or not any(k in cache for k in KNOWN_KEYS):
         raise ValueError(f"{path} does not look like a usage cache (no {', '.join(KNOWN_KEYS)})")
     models = cache.get("modelUsage")
