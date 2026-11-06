@@ -4575,9 +4575,96 @@ def load_cache(path):
     return cache
 
 
+DEFAULT_CACHE = Path.home() / ".claude" / "stats-cache.json"
+
+
+def start_report(path):
+    """What this machine has, before any command is chosen.
+
+    A bare invocation used to be a parser error: seven command names and no
+    statement about the receipt sitting at the default path. This reads that
+    path once and reports only what the file itself says - an absent file is
+    "nothing", never a zero.
+    """
+    path = Path(path)
+    payload = {
+        "receipt": str(path),
+        "readable": False,
+        "models": None,
+        "days": None,
+        "as_of": None,
+        "reason": None,
+    }
+    try:
+        cache = load_cache(str(path))
+    except OSError as exc:
+        payload["reason"] = exc.strerror or str(exc)
+        return payload
+    except (json.JSONDecodeError, ValueError) as exc:
+        reason = str(exc)
+        for prefix in (f"{path}: ", f"{path} "):
+            if reason.startswith(prefix):
+                reason = reason[len(prefix):]
+                break
+        payload["reason"] = reason
+        return payload
+    payload["readable"] = True
+    models = cache.get("modelUsage")
+    payload["models"] = len(models) if isinstance(models, dict) else 0
+    days = cache.get("dailyActivity")
+    payload["days"] = len(days) if isinstance(days, list) else None
+    payload["as_of"] = cache.get("lastComputedDate") or None
+    return payload
+
+
+START_COMMANDS = (
+    ("scan", "lifetime tokens per model, and every place a dollar figure is a placeholder"),
+    ("units", "fields that are zero on every model while tokens are not"),
+    ("nested", "the same totals split by scope (reads ~/.claude/projects)"),
+    ("compare", "two counters side by side (also needs Codex rollouts)"),
+)
+
+
+def render_start(payload):
+    lines = [
+        "quotamirror - what is on this machine",
+        f"  receipt : {_tilde(payload['receipt'])}",
+    ]
+    if not payload["readable"]:
+        lines.append(f"  found   : nothing - {payload['reason']}")
+        lines.append(
+            "  scope   : this is the only path a bare invocation opens; every command "
+            "takes --path FILE"
+        )
+        return "\n".join(lines) + "\n"
+    if not payload["models"]:
+        lines.append(
+            "  found   : readable, but this receipt carries no modelUsage entries - "
+            "no model count to report"
+        )
+    else:
+        parts = [f"{payload['models']} model(s)"]
+        if payload["days"] is not None:
+            parts.append(f"{payload['days']} day(s) of dailyActivity")
+        if payload["as_of"]:
+            parts.append(f"as of {payload['as_of']}")
+        lines.append(f"  found   : {', '.join(parts)}")
+    lines.append(
+        "  scope   : the receipt commands open this one path; a transcript command "
+        "reads ~/.claude/projects instead"
+    )
+    lines.append("")
+    lines.append("START WITH")
+    width = max(len(name) for name, _ in START_COMMANDS)
+    for name, blurb in START_COMMANDS:
+        lines.append(f"  {name.ljust(width)}  {blurb}")
+    lines.append(f"  {'--help'.ljust(width)}  every command, every flag")
+    return "\n".join(lines) + "\n"
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="quotamirror")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
     scan = sub.add_parser("scan", help="read a usage cache and print a receipt")
     _add_path_arg(
         scan,
@@ -4747,6 +4834,11 @@ def main(argv=None):
     )
     compare_output.add_argument("--json", action="store_true", help="machine-readable payload")
     args = parser.parse_args(argv)
+
+    if args.command is None:
+        payload = start_report(DEFAULT_CACHE)
+        sys.stdout.write(render_start(payload))
+        return 0 if payload["readable"] else 2
     if args.command in {"nested", "compare"}:
         try:
             _floor(args.min_tokens, args.tolerance)

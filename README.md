@@ -35,6 +35,29 @@ cd quotamirror
 python3 quotamirror.py --help
 ```
 
+## Start here
+
+Run with no command and `quotamirror` says what is on this machine before asking you to choose:
+
+```text
+$ python3 quotamirror.py
+quotamirror - what is on this machine
+  receipt : ~/.claude/stats-cache.json
+  found   : 9 model(s), 41 day(s) of dailyActivity, as of 2026-10-25
+  scope   : the receipt commands open this one path; a transcript command reads ~/.claude/projects instead
+
+START WITH
+  scan     lifetime tokens per model, and every place a dollar figure is a placeholder
+  units    fields that are zero on every model while tokens are not
+  nested   the same totals split by scope (reads ~/.claude/projects)
+  compare  two counters side by side (also needs Codex rollouts)
+  --help   every command, every flag
+```
+
+The counts come from the file, not from an estimate. If nothing is at that path the screen says
+`found : nothing - No such file or directory` and exits `2` instead of printing zero models; a file
+that is not a receipt names the reason it was rejected.
+
 ## Commands
 
 ### `scan` — reconcile one receipt
@@ -226,7 +249,8 @@ The process still opens local files that may contain private text. Run it only a
 ## Exit codes
 
 - `0`: report produced
-- `2`: unreadable input, unsupported shape, missing required path, or invalid argument
+- `2`: unreadable input, unsupported shape, missing required path, or invalid argument. A bare
+  `quotamirror` with no receipt at the default path also exits `2`: it found nothing to describe.
 
 Individual commands may expose additional refusal states in their JSON payloads; they do not silently convert unavailable data to zero.
 
