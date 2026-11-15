@@ -1370,6 +1370,7 @@ def _shape_diff(
     presence_compared=False,
     list_presence_compared=None,
     detect_regain=False,
+    regain_basis="same_version",
 ):
     """What changed between two shapes. Used by both drift axes."""
     if list_presence_compared is None:
@@ -1403,9 +1404,17 @@ def _shape_diff(
     elif narrowed:
         verdict = "field_narrowed"
     elif meter_regained:
-        verdict = "meter_field_regained"
+        verdict = (
+            "meter_field_regained_across_versions"
+            if regain_basis == "cross_version"
+            else "meter_field_regained"
+        )
     elif regained:
-        verdict = "field_regained"
+        verdict = (
+            "field_regained_across_versions"
+            if regain_basis == "cross_version"
+            else "field_regained"
+        )
     elif removed or added or type_changed:
         verdict = "schema_changed"
     elif not (presence_compared and list_presence_compared):
@@ -1431,6 +1440,7 @@ def _shape_diff(
         "meter_fields_narrowed": meter_narrowed,
         "regained": regained,
         "meter_fields_regained": meter_regained,
+        "regain_basis": regain_basis,
         "presence_compared": presence_compared,
         "list_presence_compared": list_presence_compared,
         "presence_axes_unmeasured": unmeasured,
@@ -1630,6 +1640,8 @@ def drift_report(store, cache_path, receipt):
         "meter_fields_narrowed": [],
         "regained": [],
         "meter_fields_regained": [],
+        "regain_basis": None,
+        "baseline_reads": None,
         "presence_compared": False,
         "list_presence_compared": False,
         "presence_axes_unmeasured": [],
@@ -1655,6 +1667,8 @@ def drift_report(store, cache_path, receipt):
         presence_compared=base_presence is not None and current_presence is not None,
         list_presence_compared=bool(baseline.get("presence_lists"))
         and current_presence is not None,
+        detect_regain=True,
+        regain_basis="cross_version",
     )
     removed = diff["removed"]
     added = diff["added"]
@@ -1677,6 +1691,8 @@ def drift_report(store, cache_path, receipt):
             "meter_fields_narrowed": diff["meter_fields_narrowed"],
             "regained": diff["regained"],
             "meter_fields_regained": diff["meter_fields_regained"],
+            "regain_basis": diff["regain_basis"],
+            "baseline_reads": baseline.get("reads"),
             "presence_compared": diff["presence_compared"],
             "list_presence_compared": diff["list_presence_compared"],
             "presence_axes_unmeasured": diff["presence_axes_unmeasured"],
@@ -1735,17 +1751,47 @@ def drift_report(store, cache_path, receipt):
     return payload
 
 
-def _regain_block(rows, priced):
-    """Header plus one line per regained field, shared by both render paths."""
-    lines = [
-        f"REGAINED ({len(rows)}) - the record had fewer carriers than this read does"
-    ]
+def _regain_reads_line(reads):
+    """How many times the other version's record was read, in words."""
+    if reads is None:
+        return "  the other version's record carries no read count, so its carriers were never checked twice."
+    if reads <= 1:
+        return "  that record was read once; one read cannot tell a short record from a narrowed one."
+    return f"  that record was read {reads} times."
+
+
+def _regain_block(rows, priced, basis="same_version", reads=None):
+    """Header plus one line per regained field, shared by both render paths.
+
+    The header has to carry which axis found this. Inside one version a return is
+    a reversal of a narrowing the record itself reported; across versions the older
+    record only had fewer carriers, and a short record looks exactly the same. Two
+    different claims, two different sentences.
+    """
+    if basis == "cross_version":
+        lines = [
+            f"REGAINED ACROSS VERSIONS ({len(rows)}) - the other version's record had"
+            " fewer carriers than this read does"
+        ]
+    else:
+        lines = [
+            f"REGAINED ({len(rows)}) - the record had fewer carriers than this read does"
+        ]
     for row in rows:
         marker = "!" if row["path"] in priced else " "
         lines.append(
             f"  {marker} {row['path']}: {row['now'][0]} of {row['now'][1]} "
             f"{_family_noun(row['family'])} (was {row['was'][0]} of {row['was'][1]})"
         )
+    if basis == "cross_version":
+        lines.append(_regain_reads_line(reads))
+        lines.append(
+            "  A vendor putting a carrier back and a record written while the file was"
+        )
+        lines.append(
+            "  still being written produce the same two counts, so nothing here says the"
+        )
+        lines.append("  vendor restored it.")
     return lines
 
 
@@ -1810,6 +1856,16 @@ def render_drift(payload):
         )
         lines.append("")
         lines.append(f"VERDICT: {payload['verdict']}")
+        if payload.get("regain_basis") == "cross_version" and payload["regained"]:
+            lines.extend(
+                _regain_block(
+                    payload["regained"],
+                    payload["meter_fields_regained"],
+                    basis="cross_version",
+                    reads=payload.get("baseline_reads"),
+                )
+            )
+            lines.append("")
         if payload["verdict"] == "possible_short_baseline":
             part = payload.get("short_baseline") or {}
             lines.append(
