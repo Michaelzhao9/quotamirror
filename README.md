@@ -180,6 +180,7 @@ Without the flag the line reads `not_read` and names the flag that would measure
 ```bash
 python3 quotamirror.py recent
 python3 quotamirror.py recent --days 30
+python3 quotamirror.py recent --days 7 --by-day
 python3 quotamirror.py recent --until 2026-10-31 --days 7
 python3 quotamirror.py recent --json
 ```
@@ -197,6 +198,19 @@ days inside the window that carry no record is on the same line as the total
 (`5 of 7 day(s) in the window carry a record; the total is a floor for those 7 days`), with
 the missing dates listed. `VERDICT: window_measured (floor)`. A quiet day and a day the
 meter never wrote look identical here, and the command says so rather than picking one.
+
+**`--by-day` prints the window one day per row, and a blank day prints `no record`.** The
+total alone cannot be audited: a reader cannot see which days it covers, and a `0` in a
+per-day table would be the exact reading this command exists to prevent, so no row ever
+carries one. The rows are the window's own day tables, not a second accounting — their sum
+is the printed total by construction, and on the corpus they were checked against
+`transcript_window`'s day table to the token.
+
+**A window no day falls into prints no total at all.** `--until` can place the window where
+the store has nothing (`VERDICT: no_records_in_window`), and a `TOTAL 0` there would say
+"zero usage measured" when what happened is that nothing was read. The window and the anchor
+are still printed, so the reader can see where the blank sits, and the day rows still name
+every day in it — none of them as a number.
 
 **Records with no timestamp belong to no window.** Their tokens are counted as *outside*
 the window, beside the tokens on days before and after it, so the total is never presented
@@ -300,7 +314,7 @@ The suite covers receipt reconciliation, unit and cumulative checks, loop dedupl
 ## Limitations
 
 - `recent` places its window by the newest recorded day, so it measures the last N days *of the store*, not the last N days of wall-clock time; a store that stopped being written three weeks ago reports three weeks ago. Use `--until` to place the window where you meant it, and read the anchor line to see which was used.
-- `recent` cannot tell a quiet day from a day the meter failed to write: both are days with no record, both make the total a floor, and both are listed as `no record`.
+- `recent` cannot tell a quiet day from a day the meter failed to write: both are days with no record, both make the total a floor, and both are printed as `no record`. `--by-day` makes each one visible as a row instead of a date in a comma list, and it makes a run of blank days obvious, but it cannot label them - a store only holds what it wrote, so a holiday and a broken meter leave the same shape. A truly empty window prints no total at all rather than `0`.
 - `recent` measures tokens, never a share of a plan allowance: no quota ceiling is in the store, and none is assumed.
 
 - Receipt field names and shapes are harness-specific and can change.

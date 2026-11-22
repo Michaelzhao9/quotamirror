@@ -4265,6 +4265,7 @@ def recent_window(root, days=RECENT_DAYS_DEFAULT, until=None, max_files=None):
                 "total_tokens": None,
                 "tokens": None,
                 "rows": [],
+                "by_day": [],
                 "share_basis": None,
                 "raw_record_sum": None,
                 "days_with_records": None,
@@ -4291,13 +4292,18 @@ def recent_window(root, days=RECENT_DAYS_DEFAULT, until=None, max_files=None):
     raw_record_sum = 0
     days_with_records = 0
     missing = []
+    by_day = []
     for offset in range(days):
         day = (first + timedelta(days=offset)).isoformat()
         table = day_tables.get(day)
         if table is None:
             missing.append(day)
+            # No record is not a zero: the row says the day is uncovered, and
+            # carries no number a reader could mistake for a measurement.
+            by_day.append({"day": day, "recorded": False, "tokens": None})
             continue
         days_with_records += 1
+        by_day.append({"day": day, "recorded": True, "tokens": table["total_tokens"]})
         raw_record_sum += table["naive_tokens"]
         for bucket in CLAUDE_TOKEN_BUCKETS:
             tokens[bucket] += table["by_bucket"][bucket]
@@ -4323,8 +4329,11 @@ def recent_window(root, days=RECENT_DAYS_DEFAULT, until=None, max_files=None):
             days_after += 1
             tokens_after += table["total_tokens"]
 
-    total = sum(tokens.values())
-    share_total = sum(tokens[bucket] for bucket in NON_CACHE_BUCKETS)
+    # A window no recorded day falls into has no total: printing 0 there would be
+    # the exact reading this command exists to prevent (absence read as zero).
+    measured = bool(days_with_records)
+    total = sum(tokens.values()) if measured else None
+    share_total = sum(tokens[bucket] for bucket in NON_CACHE_BUCKETS) if measured else 0
     rows = []
     for model, model_tokens in sorted(by_model.items(), key=lambda item: (-item[1], item[0])):
         rows.append(
@@ -4352,10 +4361,13 @@ def recent_window(root, days=RECENT_DAYS_DEFAULT, until=None, max_files=None):
                 "basis": "record_timestamp",
             },
             "total_tokens": total,
-            "tokens": tokens,
+            "tokens": tokens if measured else None,
             "rows": rows,
-            "share_basis": {"name": "non_cache_read_tokens", "tokens": share_total},
-            "raw_record_sum": raw_record_sum,
+            "by_day": by_day,
+            "share_basis": {"name": "non_cache_read_tokens", "tokens": share_total}
+            if measured
+            else None,
+            "raw_record_sum": raw_record_sum if measured else None,
             "days_with_records": days_with_records,
             "missing_days": missing,
             "missing_count": len(missing),
@@ -4384,7 +4396,73 @@ def _bucket_text(tokens):
     return ", ".join(f"{labels[bucket]} {tokens[bucket]:,}" for bucket in CLAUDE_TOKEN_BUCKETS)
 
 
-def render_recent_window(payload):
+def _recent_token_lines(payload):
+    """The model table, buckets and the repeated-write note for a measured window."""
+    out = ["TOKENS IN THE WINDOW (deduped by message id, larger value per bucket)"]
+    if payload["rows"]:
+        width = max([len(row["model"]) for row in payload["rows"]] + [len("TOTAL")])
+        for row in payload["rows"]:
+            share = (
+                f"{row['share_pct']:5.1f}% of {row['of_tokens']:,} non_cache_read_tokens"
+                if row["share_pct"] is not None
+                else "share not measured -- the share basis is zero"
+            )
+            out.append(f"  {row['model']:<{width}}  {row['total_tokens']:>16,}  {share}")
+        out.append(f"  {'TOTAL':<{width}}  {payload['total_tokens']:>16,}")
+    else:
+        out.append(f"  {'TOTAL':<8}  {payload['total_tokens']:>16,}")
+    out.append(f"  buckets: {_bucket_text(payload['tokens'])}")
+    if payload["tokens"]["cache_read_input_tokens"] and payload["share_basis"]["tokens"]:
+        read_share = payload["tokens"]["cache_read_input_tokens"] * 100.0 / (
+            payload["share_basis"]["tokens"] + payload["tokens"]["cache_read_input_tokens"]
+        )
+        out.append(
+            f"  cache_read is outside the share basis: {payload['tokens']['cache_read_input_tokens']:,} "
+            f"= {read_share:.1f}% of this window's tokens and would drown every other bucket"
+        )
+    if payload["raw_record_sum"] and payload["raw_record_sum"] != payload["total_tokens"]:
+        extra = payload["raw_record_sum"] - payload["total_tokens"]
+        pct = extra * 100.0 / payload["total_tokens"] if payload["total_tokens"] else None
+        line = f"  raw record sum: {payload['raw_record_sum']:,} ({extra:,} above the deduped total"
+        line += f" = {pct:.1f}%" if pct is not None else ""
+        out.append(
+            line + "; repeated writes of one message, so neither is interchangeable with the other)"
+        )
+    return out
+
+
+def _recent_by_day_lines(payload):
+    """One row per day in the window, so the floor is auditable instead of described.
+
+    A day no record fell on prints `no record`. It never prints 0: this is the
+    same rule the empty-store path follows, applied per day. The rows are the
+    window's own day tables, so their sum is the printed total by construction.
+    """
+    out = [""]
+    out.append("BY DAY (one row per day in the window; a blank day is an absence, never a zero)")
+    recorded = [row for row in payload["by_day"] if row["recorded"]]
+    for row in payload["by_day"]:
+        if row["recorded"]:
+            out.append(f"  {row['day']}  {row['tokens']:>16,}")
+        else:
+            out.append(f"  {row['day']}  {'no record':>16}")
+    if payload["total_tokens"] is None:
+        out.append("  no row carries a number, so there is no sum to take")
+    else:
+        row_sum = sum(row["tokens"] for row in recorded)
+        out.append(
+            f"  rows sum to {row_sum:,} = TOTAL ({len(payload['by_day'])} day(s), "
+            f"{payload['missing_count']} without a record)"
+        )
+        out.append(
+            "  A blank row is an absence of records, not a measured quiet day: this store only holds "
+            "what it wrote,"
+        )
+        out.append("  so a day it did not write and a day nothing happened look the same in it.")
+    return out
+
+
+def render_recent_window(payload, by_day=False):
     """The printed form: what was read, where the window sits, and what it excludes."""
     out = ["RECENT WINDOW  (tokens inside a declared trailing window)"]
     out.append(f"  source        : {payload.get('source') or payload.get('root')}")
@@ -4420,35 +4498,14 @@ def render_recent_window(payload):
             f"  anchor        : last recorded day {anchor['day']} (measured from the records this run read)"
         )
     out.append("")
-    out.append("TOKENS IN THE WINDOW (deduped by message id, larger value per bucket)")
-
-    if payload["rows"]:
-        width = max([len(row["model"]) for row in payload["rows"]] + [len("TOTAL")])
-        for row in payload["rows"]:
-            share = (
-                f"{row['share_pct']:5.1f}% of {row['of_tokens']:,} non_cache_read_tokens"
-                if row["share_pct"] is not None
-                else "share not measured -- the share basis is zero"
-            )
-            out.append(f"  {row['model']:<{width}}  {row['total_tokens']:>16,}  {share}")
-        out.append(f"  {'TOTAL':<{width}}  {payload['total_tokens']:>16,}")
-    else:
-        out.append(f"  {'TOTAL':<8}  {payload['total_tokens']:>16,}")
-    out.append(f"  buckets: {_bucket_text(payload['tokens'])}")
-    if payload["tokens"]["cache_read_input_tokens"] and payload["share_basis"]["tokens"]:
-        read_share = payload["tokens"]["cache_read_input_tokens"] * 100.0 / (
-            payload["share_basis"]["tokens"] + payload["tokens"]["cache_read_input_tokens"]
-        )
+    if payload["total_tokens"] is None:
         out.append(
-            f"  cache_read is outside the share basis: {payload['tokens']['cache_read_input_tokens']:,} "
-            f"= {read_share:.1f}% of this window's tokens and would drown every other bucket"
+            "  total         : not measured -- no day in the window carries a record, so there is no sum"
         )
-    if payload["raw_record_sum"] and payload["raw_record_sum"] != payload["total_tokens"]:
-        extra = payload["raw_record_sum"] - payload["total_tokens"]
-        pct = extra * 100.0 / payload["total_tokens"] if payload["total_tokens"] else None
-        line = f"  raw record sum: {payload['raw_record_sum']:,} ({extra:,} above the deduped total"
-        line += f" = {pct:.1f}%" if pct is not None else ""
-        out.append(line + "; repeated writes of one message, so neither is interchangeable with the other)")
+    else:
+        out.extend(_recent_token_lines(payload))
+    if by_day:
+        out.extend(_recent_by_day_lines(payload))
 
     out.append("")
     out.append("COVERAGE")
@@ -4464,7 +4521,7 @@ def render_recent_window(payload):
         out.append(line)
     elif payload["verdict"] == "no_records_in_window":
         out.append(
-            "  no record falls inside the window; this zero is an absence of records, not a measured quiet period"
+            "  no record falls inside the window, so nothing here is a measurement of it -- not even a zero"
         )
     else:
         out.append(
@@ -4485,6 +4542,11 @@ def render_recent_window(payload):
         out.append(
             "  Days with no record are counted, not assumed quiet: the meter may not have written them, "
             "and this command cannot tell a quiet day from a missing one."
+        )
+    elif payload["verdict"] == "no_records_in_window":
+        out.append(
+            "  No day in the window carries a record, so no total is printed: an absence of records is "
+            "not an observation of zero usage."
         )
     else:
         out.append("  Every day in the window carries a recorded total; nothing here is interpolated.")
@@ -5149,6 +5211,14 @@ def main(argv=None):
         ),
     )
     recent_output.add_argument("--json", action="store_true", help="machine-readable payload")
+    recent_output.add_argument(
+        "--by-day",
+        action="store_true",
+        help=(
+            "print one row per day in the window; a day with no record prints 'no record', never 0 "
+            "(the rows sum to the same total, they are not a second accounting)"
+        ),
+    )
     nested = sub.add_parser(
         "nested",
         help=(
@@ -5276,7 +5346,7 @@ def main(argv=None):
         if args.json:
             print(json.dumps(payload, indent=2, sort_keys=True))
         else:
-            sys.stdout.write(render_recent_window(payload))
+            sys.stdout.write(render_recent_window(payload, by_day=args.by_day))
         return 0
 
     if args.command == "nested":
