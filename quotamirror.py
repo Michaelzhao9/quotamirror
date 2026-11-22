@@ -4210,6 +4210,257 @@ def transcript_window(root, max_files=None):
     }
 
 
+def _day_of(value):
+    """A YYYY-MM-DD prefix as a date, or None - never a guess from a partial stamp."""
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _receipt_day_table(cache):
+    """The receipt's own per-day message counts, keyed by date.
+
+    A row is a positive statement ("this day was computed"); its message count
+    may still be zero. The row set is what the span is read from, so a day the
+    table computed and found empty is not confused with a day outside the table.
+    """
+    table = {}
+    for row in cache.get("dailyActivity") or []:
+        if not isinstance(row, dict):
+            continue
+        day = _day_of(row.get("date"))
+        if day is None:
+            continue
+        try:
+            table[day] = int(row.get("messageCount") or 0)
+        except (TypeError, ValueError):
+            continue
+    return table
+
+
+def quiet_days(cache, scan):
+    """Name the days each of two independent stores is silent on.
+
+    `recent --by-day` can already say a day carries no token record. It cannot
+    say why, and inside one store it never will: a holiday and an unmetered day
+    leave the same shape. The receipt and the transcripts are separate stores,
+    and each carries a positive claim of its own - the receipt counts messages,
+    the transcripts count tokens.
+
+    So this command never answers "this day was quiet". It answers which side
+    holds a record and which does not:
+
+    * both sides count something -> the day is measured;
+    * the receipt counts messages while the transcripts hold no token record ->
+      the day is *not* quiet. Either the tokens went unrecorded or those
+      transcripts are not on this machine; both are different from a holiday;
+    * the transcripts hold tokens while the receipt has no activity row -> the
+      receipt's day table does not cover that day;
+    * neither side holds a record -> silent, printed as an absence and never as
+      a zero.
+
+    The window is the intersection of the two spans, because a day only one
+    store reaches cannot be called silent on both. Days outside it are counted,
+    not dropped, in `days_outside_window`.
+    """
+    activity = _receipt_day_table(cache)
+    transcript_days = {}
+    for key, entry in ((scan or {}).get("days") or {}).items():
+        day = _day_of(key)
+        if day is None or not isinstance(entry, dict):
+            continue
+        tokens = int(entry.get("total_tokens") or 0)
+        if tokens:
+            transcript_days[day] = tokens
+
+    payload = {
+        "available": False,
+        "verdict": "unavailable",
+        "reason": None,
+        "receipt_span": None,
+        "last_computed": None,
+        "transcript_span": None,
+        "window": None,
+        "days_in_window": 0,
+        "days_measured": 0,
+        "days_activity_only": 0,
+        "days_tokens_only": 0,
+        "days_silent": 0,
+        "days_outside_window": 0,
+        "measured_messages": 0,
+        "measured_tokens": 0,
+        "transcript_tokens_in_window": 0,
+        "rows": [],
+    }
+
+    if not activity:
+        payload["verdict"] = "no_day_table"
+        payload["reason"] = (
+            "the receipt carries no dailyActivity rows, so it makes no statement about any "
+            "day and cannot be compared with the transcripts"
+        )
+        if transcript_days:
+            payload["available"] = True
+            payload["transcript_span"] = [
+                str(min(transcript_days)),
+                str(max(transcript_days)),
+            ]
+        return payload
+
+    receipt_start, receipt_last = min(activity), max(activity)
+    computed = _day_of(cache.get("lastComputedDate"))
+    receipt_end = max(receipt_last, computed) if computed else receipt_last
+    payload["receipt_span"] = [str(receipt_start), str(receipt_end)]
+    payload["last_computed"] = str(computed) if computed else None
+
+    if not transcript_days:
+        payload["verdict"] = "no_transcripts"
+        payload["available"] = True
+        payload["reason"] = (
+            "no transcript on this machine carries a token record, so the receipt's days have "
+            "nothing on this side to be checked against"
+        )
+        return payload
+
+    payload["available"] = True
+    transcript_start, transcript_end = min(transcript_days), max(transcript_days)
+    payload["transcript_span"] = [str(transcript_start), str(transcript_end)]
+
+    start = max(receipt_start, transcript_start)
+    end = min(receipt_end, transcript_end)
+    if start > end:
+        payload["verdict"] = "no_overlap"
+        payload["reason"] = (
+            "the receipt's span and the transcript span do not meet, so no day is witnessed "
+            "by both stores and none may be called silent"
+        )
+        return payload
+
+    payload["window"] = [str(start), str(end)]
+    rows = []
+    day = start
+    while day <= end:
+        messages = activity.get(day, 0)
+        tokens = transcript_days.get(day)
+        if messages > 0 and tokens is not None:
+            payload["days_measured"] += 1
+            payload["measured_messages"] += messages
+            payload["measured_tokens"] += tokens
+            day += timedelta(days=1)
+            continue
+        if messages > 0:
+            payload["days_activity_only"] += 1
+            rows.append(
+                {"date": str(day), "kind": "activity_only", "messages": messages, "tokens": None}
+            )
+        elif tokens is not None:
+            payload["days_tokens_only"] += 1
+            rows.append(
+                {"date": str(day), "kind": "tokens_only", "messages": None, "tokens": tokens}
+            )
+        else:
+            payload["days_silent"] += 1
+            rows.append(
+                {"date": str(day), "kind": "silent", "messages": None, "tokens": None}
+            )
+        day += timedelta(days=1)
+
+    payload["rows"] = rows
+    payload["days_in_window"] = (end - start).days + 1
+    payload["transcript_tokens_in_window"] = sum(
+        tokens for day, tokens in transcript_days.items() if start <= day <= end
+    )
+    payload["days_outside_window"] = len(
+        [d for d in activity if not start <= d <= end]
+    ) + len([d for d in transcript_days if not start <= d <= end])
+
+    if payload["days_activity_only"]:
+        payload["verdict"] = "activity_without_tokens"
+        payload["reason"] = (
+            f"{payload['days_activity_only']} day(s) carry message counts in the receipt while "
+            "the transcripts hold no token record: those days are not quiet, whatever the "
+            "cause of the missing record"
+        )
+    elif payload["days_tokens_only"]:
+        payload["verdict"] = "tokens_without_activity"
+        payload["reason"] = (
+            f"{payload['days_tokens_only']} day(s) carry tokens in the transcripts while the "
+            "receipt's day table holds no activity row: the table does not cover them"
+        )
+    elif payload["days_silent"]:
+        payload["verdict"] = "silent_days"
+        payload["reason"] = (
+            f"{payload['days_silent']} of {payload['days_in_window']} day(s) hold a record on "
+            "neither side; they are printed as absences, which is not the same as zero usage"
+        )
+    else:
+        payload["verdict"] = "all_measured"
+        payload["reason"] = (
+            "every day in the shared window carries a record on both sides, so no silent day "
+            "is left to explain"
+        )
+    return payload
+
+
+def render_quiet(payload):
+    lines = ["SILENT DAYS (which days are quiet, and which only look quiet)", ""]
+    lines.append(f"  receipt     {_range(*payload['receipt_span']) if payload['receipt_span'] else 'none'}")
+    if payload["last_computed"]:
+        lines.append(f"  computed    through {payload['last_computed']}")
+    lines.append(
+        f"  transcripts {_range(*payload['transcript_span']) if payload['transcript_span'] else 'none'}"
+    )
+    if payload["window"]:
+        lines.append(
+            f"  window      {payload['window'][0]} .. {payload['window'][1]} "
+            f"({payload['days_in_window']} day(s))"
+        )
+    else:
+        lines.append("  window      none -- the two stores share no day")
+    lines.append("")
+    if not payload["available"] or payload["verdict"] in {
+        "no_day_table",
+        "no_transcripts",
+        "no_overlap",
+    }:
+        lines.append(f"  not measured -- {payload['reason']}")
+        lines.append(f"VERDICT: {payload['verdict']}")
+        return "\n".join(lines) + "\n"
+
+    lines.append(
+        "  DAYS: "
+        f"measured {payload['days_measured']} | "
+        f"activity without tokens {payload['days_activity_only']} | "
+        f"tokens without activity {payload['days_tokens_only']} | "
+        f"silent {payload['days_silent']}"
+    )
+    gaps = [row for row in payload["rows"] if row["kind"] != "silent"]
+    if gaps:
+        lines.append("")
+        lines.append("  one side holds a record, the other does not:")
+        for row in gaps:
+            if row["kind"] == "activity_only":
+                lines.append(
+                    f"    {row['date']}  {_fmt(row['messages'])} message(s)  no token record"
+                )
+            else:
+                lines.append(
+                    f"    {row['date']}  no activity row  {_fmt(row['tokens'])} token(s)"
+                )
+    silents = [row["date"] for row in payload["rows"] if row["kind"] == "silent"]
+    if silents:
+        lines.append("")
+        lines.append(
+            f"  silent {len(silents)} day(s): {_range(silents[0], silents[-1])} "
+            "-- no record on either side, printed as an absence and not as zero"
+        )
+    lines.append("")
+    lines.append(f"VERDICT: {payload['verdict']}")
+    lines.append(f"  {payload['reason']}")
+    return "\n".join(lines) + "\n"
+
+
 RECENT_DAYS_DEFAULT = 7
 
 
@@ -5051,6 +5302,7 @@ START_COMMANDS = (
     ("scan", "lifetime tokens per model, and every place a dollar figure is a placeholder"),
     ("units", "fields that are zero on every model while tokens are not"),
     ("recent", "tokens in the last N days, with the days that carry no record named"),
+    ("quiet", "which days are silent on both sides, and which only look silent"),
     ("nested", "the same totals split by scope (reads ~/.claude/projects)"),
     ("compare", "two counters side by side (also needs Codex rollouts)"),
 )
@@ -5219,6 +5471,28 @@ def main(argv=None):
             "(the rows sum to the same total, they are not a second accounting)"
         ),
     )
+    quiet = sub.add_parser(
+        "quiet",
+        help=(
+            "which days are silent on both sides, and which only look silent: the receipt's "
+            "day table against the transcripts' token days"
+        ),
+    )
+    _add_path_arg(
+        quiet,
+        Path.home() / ".claude" / "stats-cache.json",
+        "the receipt whose day table is compared",
+    )
+    quiet.add_argument(
+        "--transcripts",
+        default=str(Path.home() / ".claude" / "projects"),
+        help="the transcript directory compared against that day table (default ~/.claude/projects)",
+    )
+    quiet.add_argument(
+        "--max-files", type=int, default=None, help="only the newest N transcripts"
+    )
+    quiet.add_argument("--json", action="store_true", help="machine-readable payload")
+
     nested = sub.add_parser(
         "nested",
         help=(
@@ -5347,6 +5621,31 @@ def main(argv=None):
             print(json.dumps(payload, indent=2, sort_keys=True))
         else:
             sys.stdout.write(render_recent_window(payload, by_day=args.by_day))
+        return 0
+
+    if args.command == "quiet":
+        try:
+            cache = load_cache(args.path)
+        except OSError as exc:
+            print(f"quotamirror: cannot read {args.path}: {exc.strerror or exc}", file=sys.stderr)
+            return 2
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(f"quotamirror: {exc}", file=sys.stderr)
+            return 2
+        root = Path(args.transcripts)
+        if not root.exists():
+            print(f"quotamirror: no transcripts at {root}", file=sys.stderr)
+            return 2
+        scan = scan_usage(root, max_files=args.max_files)
+        payload = quiet_days(cache, scan)
+        payload["source"] = str(Path(args.path).resolve())
+        payload["transcript_root"] = str(root.resolve())
+        payload["files"] = len(scan["files"])
+        payload = redact_home(payload)
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print(render_quiet(payload), end="")
         return 0
 
     if args.command == "nested":
