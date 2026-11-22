@@ -233,41 +233,57 @@ python3 quotamirror.py quiet --transcripts ~/.claude/projects --max-files 200
 
 `recent --by-day` can say a day carries no token record. It cannot say *why*, and inside a
 single store it never will: a holiday and a day the meter failed to write leave the same shape.
-`quiet` does not try to guess from one store. It puts the receipt's day table beside the
-transcripts' token days and reports which side holds a record.
+`quiet` does not try to guess from one store. It reads every day table this machine has — the
+receipt's `dailyActivity` (messages per day), the receipt's `dailyModelTokens` (tokens per day)
+and the transcripts' token days — and reports which side holds a record.
 
-**A day the receipt counts messages on is not quiet.** That is the whole rule. The receipt is
+**A day the receipt counts messages on is not quiet.** That is the base rule. The receipt is
 a positive statement of its own — it says 900 messages happened — so a day it names while
-the transcripts hold nothing is printed as `N messages, no token record`, never as a blank.
+the transcripts hold nothing is never printed as a blank.
+
+**A day the receipt bills is not unmetered.** `dailyModelTokens` states a token total per day.
+When it has a row for a day the transcripts hold nothing for, "no token record" would hide a
+number the receipt in hand carries, so the row says whose number it is:
 
 ```
-activity without tokens:
-  2026-09-03    900 message(s)  no token record
-  2026-09-04    111 message(s)  no token record
+  DAYS: measured 24 | receipt bills, transcripts silent 3 | activity without tokens 1 | tokens without activity 0 | silent 40
+  totals      receipt 5,040,000 | transcripts 1,260,000 -- the two sides are not reconciled here
+
+  one side holds a record, the other does not:
+    2026-09-03    900 message(s)  receipt bills 4,200 token(s)  transcripts hold none
 ```
 
-Those two rows are a labelled synthetic example, not a real corpus: the receipt counts the
-messages, the transcripts hold no token record for those days, and the days around them do
-have transcript records — so the absence is in the record and not in the span. A real run
-prints whatever its own two stores hold, and nothing else.
+Every figure above is invented to show the shape; a real run prints what its own two stores
+hold. The billed tokens are counted separately (`receipt_tokens_billed`) and are never added
+into the transcript side; the verdict is `billed_without_transcripts`, because a transcript
+total inside such a window is a floor and not a measurement of it. A row that sums to zero, and
+a receipt with no such table, do not upgrade a day: a zero states nothing.
+
+**Five states, five names, no zeros.** `measured` (both sides count), `receipt bills,
+transcripts silent` (the receipt's token table states the day, the transcripts do not reach it),
+`activity without tokens` (messages counted, no table states a token number), `tokens without
+activity` (transcripts yes, the message table has no row — it lags) and `silent` (no side). The
+fifth term is printed only when it is non-zero, so the terms still add up to the window; a
+silent day is printed as an absence and carries no number.
+
+**The two totals are printed and not reconciled.** `measured` says both stores hold a record on
+a day — not that they agree on the amount, and on the corpus this was built against the two
+totals differ by a multiple on the very days both reach. Both are printed side by side with
+that sentence, so neither can be read as the window's usage; matching a day's two numbers is
+`compare`'s and `crosscheck`'s job, not this command's.
 
 **The window is the intersection of the two spans.** A day only one store reaches cannot be
-called silent on both, so it is counted outside the window rather than judged; the two spans
-and the window are printed above the counts, and the count of those days is its own line —
-`outside     25 day(s) are reached by only one store - not judged here` (synthetic figure) —
-because the four state counts add up to the window only, and the printed arithmetic would
-otherwise look complete while 25 days had been set aside.
-
-**Four states, four names, no zeros.** `measured` (both sides count), `activity without
-tokens` (receipt yes, transcripts no), `tokens without activity` (transcripts yes, the day
-table has no row — the table lags), and `silent` (neither side). A silent day is printed as an
-absence and carries no number: `silent 12 day(s): 2026-05-05 .. 2026-05-16 -- no record on
-either side, printed as an absence and not as zero` — again a synthetic span, shown for shape.
+called silent on both, so it is counted outside the window rather than judged; a day the
+receipt's token table states belongs to the receipt's span even when it has no message row. The
+count of excluded days is its own line — `outside     9 day(s) are reached by only one store
+- not judged here` (synthetic figure) — because the state counts add up to the window only, and
+the printed arithmetic would otherwise look complete while those days had been set aside.
 
 **Nothing to compare is not a clean bill.** A receipt with no `dailyActivity`, a transcript
 directory with no usage record, or two spans that do not meet print `not measured` with the
-reason and no counts (`no_day_table`, `no_transcripts`, `no_overlap`). A zero there would be a
-claim the run cannot make.
+reason and no counts (`no_day_table`, `no_transcripts`, `no_overlap`). A receipt that carries
+per-day token totals and no message table says so rather than claiming it states nothing. A
+zero there would be a claim the run cannot make.
 
 Measured totals are read from each side's own table — `measured_tokens` is the sum of the
 scan's day entries and `transcript_tokens_in_window` is the same number by construction, so
@@ -366,7 +382,7 @@ The suite covers receipt reconciliation, unit and cumulative checks, loop dedupl
 
 - `recent` places its window by the newest recorded day, so it measures the last N days *of the store*, not the last N days of wall-clock time; a store that stopped being written three weeks ago reports three weeks ago. Use `--until` to place the window where you meant it, and read the anchor line to see which was used.
 - `recent` cannot tell a quiet day from a day the meter failed to write: both are days with no record, both make the total a floor, and both are printed as `no record`. `--by-day` makes each one visible as a row instead of a date in a comma list, and it makes a run of blank days obvious, but it cannot label them - a store only holds what it wrote, so a holiday and a broken meter leave the same shape. A truly empty window prints no total at all rather than `0`. `quiet` is the one place this is separated, and only where two independent stores both reach: a day the receipt counts messages on is not quiet, whatever the transcripts hold. Outside that intersection nothing is claimed.
-- `quiet` does not say *why* a day carries messages and no tokens. It cannot: the transcripts may have been pruned, the client may not write them, or the tokens may have gone unrecorded. It only refuses to call such a day quiet, and names it per day.
+- `quiet` does not say *why* a day carries messages and no tokens. It now separates the days the receipt's own token table bills — the number is stated, the transcripts simply do not reach those days — from the days no table states a number for, and refuses to call either quiet. The cause itself (pruned transcripts, a client that writes none, an unmetered day) is still not decidable from the stores, and a transcript total over a window containing billed days is a floor: the two sides' totals are printed and never reconciled.
 - `recent` measures tokens, never a share of a plan allowance: no quota ceiling is in the store, and none is assumed.
 
 - Receipt field names and shapes are harness-specific and can change.

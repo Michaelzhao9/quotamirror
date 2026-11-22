@@ -18,8 +18,12 @@ import json
 import quotamirror
 
 
-def cache_with(days, last_computed=None):
-    """A receipt carrying only the fields this command reads."""
+def cache_with(days, last_computed=None, tokens=None):
+    """A receipt carrying only the fields this command reads.
+
+    `tokens` adds the receipt's *second* day table, `dailyModelTokens`: the
+    receipt's own per-day token meter. A receipt may carry it or not.
+    """
     payload = {
         "version": 3,
         "dailyActivity": [
@@ -27,6 +31,11 @@ def cache_with(days, last_computed=None):
             for date, messages in days
         ],
     }
+    if tokens is not None:
+        payload["dailyModelTokensVersion"] = 3
+        payload["dailyModelTokens"] = [
+            {"date": date, "tokensByModel": {"claude-test": total}} for date, total in tokens
+        ]
     if last_computed is not None:
         payload["lastComputedDate"] = last_computed
     return payload
@@ -306,3 +315,183 @@ def test_cli_quiet_prints_the_outside_count(tmp_path, capsys):
     text = capsys.readouterr().out
     assert "outside" in text
     assert "2 day(s)" in text
+
+
+def _gap_cache_and_scan(tmp_path):
+    """05-03 is the day the transcripts miss; every other day is covered."""
+    scan = scan_of(
+        tmp_path,
+        {
+            "a.jsonl": [
+                usage_line("m1", "2026-05-02T10:00:00Z"),
+                usage_line("m2", "2026-05-06T10:00:00Z"),
+            ]
+        },
+    )
+    days = [("2026-05-02", 100), ("2026-05-03", 500), ("2026-05-06", 100)]
+    return days, scan
+
+
+def test_a_day_the_receipt_bills_is_not_reported_as_unmetered(tmp_path):
+    # The receipt carries two day tables. `dailyActivity` counts messages and
+    # says nothing about tokens; `dailyModelTokens` is its token meter, and on
+    # this day it bills 5,000 tokens. Reading only the message table would let
+    # this command tell the reader that the day has no token record anywhere,
+    # when the receipt in hand states the number. The day is billed: only the
+    # transcripts are silent on it.
+    days, scan = _gap_cache_and_scan(tmp_path)
+    result = quotamirror.quiet_days(
+        cache_with(days, tokens=[("2026-05-03", 5000)]), scan
+    )
+
+    assert result["days_receipt_billed"] == 1
+    assert result["days_activity_only"] == 0
+    assert result["verdict"] == "billed_without_transcripts"
+    row = next(row for row in result["rows"] if row["date"] == "2026-05-03")
+    assert row["kind"] == "receipt_billed"
+    assert row["messages"] == 500
+    assert row["receipt_tokens"] == 5000
+    # The transcripts still hold nothing, and an absence is not a zero.
+    assert row["tokens"] is None
+    assert result["receipt_tokens_billed"] == 5000
+
+
+def test_receipt_billed_tokens_in_the_window_are_not_called_transcript_tokens(tmp_path):
+    days, scan = _gap_cache_and_scan(tmp_path)
+    result = quotamirror.quiet_days(
+        cache_with(
+            days,
+            tokens=[("2026-05-02", 900), ("2026-05-03", 5000), ("2026-05-06", 900)],
+        ),
+        scan,
+    )
+
+    # The receipt bills 6,800 inside the window; the transcripts hold 20. The
+    # two sides are kept apart, never added into a total that describes neither.
+    assert result["receipt_tokens_in_window"] == 6800
+    assert result["receipt_tokens_billed"] == 5000
+    assert result["days_receipt_billed"] == 1
+    assert result["days_measured"] == 2
+
+
+def test_every_day_in_the_window_is_counted_once_whatever_the_receipt_bills(tmp_path):
+    scan = scan_of(
+        tmp_path,
+        {
+            "a.jsonl": [
+                usage_line("m1", "2026-05-02T10:00:00Z"),
+                usage_line("m2", "2026-05-04T10:00:00Z"),
+            ]
+        },
+    )
+    result = quotamirror.quiet_days(
+        cache_with(
+            [("2026-05-02", 100), ("2026-05-03", 500), ("2026-05-04", 100)],
+            tokens=[("2026-05-03", 5000)],
+        ),
+        scan,
+    )
+
+    kinds = [row["kind"] for row in result["rows"]]
+    assert kinds.count("receipt_billed") == 1
+    counted = (
+        result["days_measured"]
+        + result["days_receipt_billed"]
+        + result["days_activity_only"]
+        + result["days_tokens_only"]
+        + result["days_silent"]
+    )
+    assert counted == result["days_in_window"] == 3
+
+
+def test_a_zero_token_row_does_not_upgrade_a_day_to_billed(tmp_path):
+    days, scan = _gap_cache_and_scan(tmp_path)
+    result = quotamirror.quiet_days(cache_with(days, tokens=[("2026-05-03", 0)]), scan)
+
+    assert result["days_receipt_billed"] == 0
+    assert result["days_activity_only"] == 1
+    assert result["verdict"] == "activity_without_tokens"
+
+
+def test_a_token_row_extends_the_receipt_span(tmp_path):
+    # A per-day token row is the receipt speaking for that day. A day it bills
+    # must fall inside the window, or the row would be dropped from the window
+    # while the receipt in hand still carries it.
+    scan = scan_of(
+        tmp_path,
+        {
+            "a.jsonl": [
+                usage_line("m1", "2026-05-04T10:00:00Z"),
+                usage_line("m2", "2026-05-06T10:00:00Z"),
+            ]
+        },
+    )
+    result = quotamirror.quiet_days(
+        cache_with([("2026-05-04", 400)], tokens=[("2026-05-06", 7000)]), scan
+    )
+
+    assert result["receipt_span"] == ["2026-05-04", "2026-05-06"]
+    assert result["window"] == ["2026-05-04", "2026-05-06"]
+    # 05-06 carries tokens in both stores but has no activity row.
+    row = next(row for row in result["rows"] if row["date"] == "2026-05-06")
+    assert row["kind"] == "tokens_only"
+    assert row["receipt_tokens"] == 7000
+
+
+def test_the_days_line_stays_arithmetic_with_a_billed_day(tmp_path):
+    days, scan = _gap_cache_and_scan(tmp_path)
+    result = quotamirror.quiet_days(cache_with(days, tokens=[("2026-05-03", 5000)]), scan)
+    text = quotamirror.render_quiet(result)
+
+    line = next(line for line in text.splitlines() if line.strip().startswith("DAYS:"))
+    numbers = [int(part.split()[-1]) for part in line.split("|")]
+    assert sum(numbers) == result["days_in_window"] == 5
+    assert "receipt bills" in line
+    # The day's own number has to be visible, and named as the receipt's.
+    assert "5,000" in text
+    assert "receipt bills 5,000 token(s)" in text
+
+
+def test_token_rows_without_a_message_table_are_not_compared(tmp_path):
+    # A receipt can carry per-day token totals and no dailyActivity rows. The
+    # token table is a statement, but there is no message count to check it
+    # against, so the command must say what it holds instead of claiming the
+    # receipt "makes no statement about any day".
+    scan = scan_of(tmp_path, {"a.jsonl": [usage_line("m1", "2026-05-04T10:00:00Z")]})
+    result = quotamirror.quiet_days(
+        {"version": 3, "dailyModelTokens": [{"date": "2026-05-04", "tokensByModel": {"m": 900}}]},
+        scan,
+    )
+
+    assert result["verdict"] == "no_day_table"
+    assert result["receipt_token_days"] == 1
+    assert "per-day token" in result["reason"]
+    assert "no dailyActivity" in result["reason"]
+
+
+def test_the_two_sides_totals_are_printed_and_not_reconciled(tmp_path):
+    # "measured 30" says both stores hold a record on a day; it does not say
+    # they agree on the amount. Printing one side's total alone lets the reader
+    # take it for the window's usage, so both are printed with the gap named.
+    scan = scan_of(
+        tmp_path,
+        {
+            "a.jsonl": [
+                usage_line("m1", "2026-05-04T10:00:00Z", 700),
+                usage_line("m2", "2026-05-05T10:00:00Z", 300),
+            ]
+        },
+    )
+    result = quotamirror.quiet_days(
+        cache_with(
+            [("2026-05-04", 400), ("2026-05-05", 400)], tokens=[("2026-05-04", 4000)]
+        ),
+        scan,
+    )
+    text = quotamirror.render_quiet(result)
+
+    totals = [line for line in text.splitlines() if line.strip().startswith("totals")]
+    assert len(totals) == 1
+    assert "4,000" in totals[0]
+    assert "1,000" in totals[0]
+    assert "not reconciled" in totals[0]

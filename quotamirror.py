@@ -4239,32 +4239,71 @@ def _receipt_day_table(cache):
     return table
 
 
+def _receipt_token_table(cache):
+    """The receipt's own per-day token totals, keyed by date.
+
+    `dailyActivity` counts messages and says nothing about tokens; this is the
+    receipt's *second* day table, and on this machine it is the only place the
+    receipt states a token number per day. A row with a positive total is the
+    receipt speaking for that day. A row that sums to zero states nothing, so it
+    is left out: a zero must never upgrade a day into a measured one.
+    """
+    table = {}
+    for row in cache.get("dailyModelTokens") or []:
+        if not isinstance(row, dict):
+            continue
+        day = _day_of(row.get("date"))
+        if day is None:
+            continue
+        by_model = row.get("tokensByModel")
+        if not isinstance(by_model, dict):
+            continue
+        total = 0
+        usable = True
+        for value in by_model.values():
+            try:
+                total += int(value or 0)
+            except (TypeError, ValueError):
+                usable = False
+                break
+        if usable and total > 0:
+            table[day] = total
+    return table
+
+
 def quiet_days(cache, scan):
     """Name the days each of two independent stores is silent on.
 
     `recent --by-day` can already say a day carries no token record. It cannot
     say why, and inside one store it never will: a holiday and an unmetered day
     leave the same shape. The receipt and the transcripts are separate stores,
-    and each carries a positive claim of its own - the receipt counts messages,
-    the transcripts count tokens.
+    and each carries a positive claim of its own - the receipt counts messages
+    and, in its `dailyModelTokens` table, states a token total per day; the
+    transcripts count tokens.
 
     So this command never answers "this day was quiet". It answers which side
     holds a record and which does not:
 
     * both sides count something -> the day is measured;
-    * the receipt counts messages while the transcripts hold no token record ->
-      the day is *not* quiet. Either the tokens went unrecorded or those
-      transcripts are not on this machine; both are different from a holiday;
+    * the receipt's token table bills the day while the transcripts hold no
+      token record -> the receipt states the number and the transcript corpus
+      does not reach that day. Those tokens are counted separately and never
+      added to the transcript side, and the day's own number is printed;
+    * the receipt counts messages but neither token table states a number for
+      the day -> the day is *not* quiet, but no store can say what it cost;
     * the transcripts hold tokens while the receipt has no activity row -> the
-      receipt's day table does not cover that day;
-    * neither side holds a record -> silent, printed as an absence and never as
-      a zero.
+      receipt's message table does not cover that day;
+    * no side holds a record -> silent, printed as an absence and never as a
+      zero.
 
     The window is the intersection of the two spans, because a day only one
-    store reaches cannot be called silent on both. Days outside it are counted,
-    not dropped, in `days_outside_window`.
+    store reaches cannot be called silent on both. A day the receipt's token
+    table states is part of the receipt's span, even when it has no activity
+    row. Days outside the window are counted, not dropped, in
+    `days_outside_window`.
     """
     activity = _receipt_day_table(cache)
+    billed_days = _receipt_token_table(cache)
     transcript_days = {}
     for key, entry in ((scan or {}).get("days") or {}).items():
         day = _day_of(key)
@@ -4280,26 +4319,38 @@ def quiet_days(cache, scan):
         "reason": None,
         "receipt_span": None,
         "last_computed": None,
+        "receipt_token_days": len(billed_days),
         "transcript_span": None,
         "window": None,
         "days_in_window": 0,
         "days_measured": 0,
+        "days_receipt_billed": 0,
         "days_activity_only": 0,
         "days_tokens_only": 0,
         "days_silent": 0,
         "days_outside_window": 0,
         "measured_messages": 0,
         "measured_tokens": 0,
+        "receipt_tokens_billed": 0,
+        "receipt_tokens_in_window": 0,
         "transcript_tokens_in_window": 0,
         "rows": [],
     }
 
     if not activity:
         payload["verdict"] = "no_day_table"
-        payload["reason"] = (
-            "the receipt carries no dailyActivity rows, so it makes no statement about any "
-            "day and cannot be compared with the transcripts"
-        )
+        if billed_days:
+            payload["reason"] = (
+                f"the receipt carries {len(billed_days)} day(s) of per-day token totals but no "
+                "dailyActivity rows, so there is no message count to compare with the "
+                "transcripts"
+            )
+            payload["receipt_span"] = [str(min(billed_days)), str(max(billed_days))]
+        else:
+            payload["reason"] = (
+                "the receipt carries no dailyActivity rows, so it makes no statement about any "
+                "day and cannot be compared with the transcripts"
+            )
         if transcript_days:
             payload["available"] = True
             payload["transcript_span"] = [
@@ -4309,6 +4360,11 @@ def quiet_days(cache, scan):
         return payload
 
     receipt_start, receipt_last = min(activity), max(activity)
+    if billed_days:
+        # A per-day token row is the receipt speaking for that day; leaving it
+        # outside the span would drop a number the receipt in hand carries.
+        receipt_start = min(receipt_start, min(billed_days))
+        receipt_last = max(receipt_last, max(billed_days))
     computed = _day_of(cache.get("lastComputedDate"))
     receipt_end = max(receipt_last, computed) if computed else receipt_last
     payload["receipt_span"] = [str(receipt_start), str(receipt_end)]
@@ -4343,26 +4399,61 @@ def quiet_days(cache, scan):
     while day <= end:
         messages = activity.get(day, 0)
         tokens = transcript_days.get(day)
+        billed = billed_days.get(day)
+        payload["receipt_tokens_in_window"] += billed or 0
         if messages > 0 and tokens is not None:
             payload["days_measured"] += 1
             payload["measured_messages"] += messages
             payload["measured_tokens"] += tokens
             day += timedelta(days=1)
             continue
-        if messages > 0:
-            payload["days_activity_only"] += 1
-            rows.append(
-                {"date": str(day), "kind": "activity_only", "messages": messages, "tokens": None}
-            )
-        elif tokens is not None:
+        if tokens is not None:
             payload["days_tokens_only"] += 1
             rows.append(
-                {"date": str(day), "kind": "tokens_only", "messages": None, "tokens": tokens}
+                {
+                    "date": str(day),
+                    "kind": "tokens_only",
+                    "messages": None,
+                    "tokens": tokens,
+                    "receipt_tokens": billed,
+                }
+            )
+        elif billed:
+            # The receipt states a token number for this day; only the
+            # transcripts are silent. Calling this "no token record" would hide
+            # a number the receipt in hand carries.
+            payload["days_receipt_billed"] += 1
+            payload["receipt_tokens_billed"] += billed
+            rows.append(
+                {
+                    "date": str(day),
+                    "kind": "receipt_billed",
+                    "messages": messages if messages > 0 else None,
+                    "tokens": None,
+                    "receipt_tokens": billed,
+                }
+            )
+        elif messages > 0:
+            payload["days_activity_only"] += 1
+            rows.append(
+                {
+                    "date": str(day),
+                    "kind": "activity_only",
+                    "messages": messages,
+                    "tokens": None,
+                    "receipt_tokens": None,
+                }
             )
         else:
             payload["days_silent"] += 1
             rows.append(
-                {"date": str(day), "kind": "silent", "messages": None, "tokens": None}
+                {
+                    "date": str(day),
+                    "kind": "silent",
+                    "messages": None,
+                    "tokens": None,
+                    "receipt_tokens": None,
+                }
             )
         day += timedelta(days=1)
 
@@ -4373,9 +4464,19 @@ def quiet_days(cache, scan):
     )
     payload["days_outside_window"] = len(
         [d for d in activity if not start <= d <= end]
-    ) + len([d for d in transcript_days if not start <= d <= end])
+    ) + len([d for d in transcript_days if not start <= d <= end]) + len(
+        [d for d in billed_days if not start <= d <= end]
+    )
 
-    if payload["days_activity_only"]:
+    if payload["days_receipt_billed"]:
+        payload["verdict"] = "billed_without_transcripts"
+        payload["reason"] = (
+            f"{payload['days_receipt_billed']} day(s) carry {payload['receipt_tokens_billed']:,} "
+            "token(s) in the receipt's own day table while the transcripts hold no record for "
+            "them: the transcript corpus does not reach those days, so its total inside the "
+            "window is a floor and not a measurement of the window"
+        )
+    elif payload["days_activity_only"]:
         payload["verdict"] = "activity_without_tokens"
         payload["reason"] = (
             f"{payload['days_activity_only']} day(s) carry message counts in the receipt while "
@@ -4408,6 +4509,13 @@ def render_quiet(payload):
     lines.append(f"  receipt     {_range(*payload['receipt_span']) if payload['receipt_span'] else 'none'}")
     if payload["last_computed"]:
         lines.append(f"  computed    through {payload['last_computed']}")
+    if payload["receipt_token_days"]:
+        lines.append(
+            f"  token meter {payload['receipt_token_days']} day(s) with a per-day total; "
+            f"{_fmt(payload['receipt_tokens_in_window'])} in the window"
+        )
+    else:
+        lines.append("  token meter absent -- the receipt states no per-day token total")
     lines.append(
         f"  transcripts {_range(*payload['transcript_span']) if payload['transcript_span'] else 'none'}"
     )
@@ -4428,12 +4536,20 @@ def render_quiet(payload):
         lines.append(f"VERDICT: {payload['verdict']}")
         return "\n".join(lines) + "\n"
 
+    parts = [
+        f"measured {payload['days_measured']}",
+        f"activity without tokens {payload['days_activity_only']}",
+        f"tokens without activity {payload['days_tokens_only']}",
+        f"silent {payload['days_silent']}",
+    ]
+    if payload["days_receipt_billed"]:
+        # A fifth term, so the four printed states still add up to the window.
+        parts.insert(1, f"receipt bills, transcripts silent {payload['days_receipt_billed']}")
+    lines.append("  DAYS: " + " | ".join(parts))
     lines.append(
-        "  DAYS: "
-        f"measured {payload['days_measured']} | "
-        f"activity without tokens {payload['days_activity_only']} | "
-        f"tokens without activity {payload['days_tokens_only']} | "
-        f"silent {payload['days_silent']}"
+        f"  totals      receipt {_fmt(payload['receipt_tokens_in_window'])} | "
+        f"transcripts {_fmt(payload['transcript_tokens_in_window'])} "
+        "-- the two sides are not reconciled here"
     )
     lines.append(
         f"  outside     {payload['days_outside_window']} day(s) are reached by only one store "
@@ -4444,7 +4560,17 @@ def render_quiet(payload):
         lines.append("")
         lines.append("  one side holds a record, the other does not:")
         for row in gaps:
-            if row["kind"] == "activity_only":
+            if row["kind"] == "receipt_billed":
+                head = (
+                    f"{_fmt(row['messages'])} message(s)"
+                    if row["messages"] is not None
+                    else "no activity row"
+                )
+                lines.append(
+                    f"    {row['date']}  {head}  receipt bills {_fmt(row['receipt_tokens'])} "
+                    "token(s)  transcripts hold none"
+                )
+            elif row["kind"] == "activity_only":
                 lines.append(
                     f"    {row['date']}  {_fmt(row['messages'])} message(s)  no token record"
                 )
