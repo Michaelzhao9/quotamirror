@@ -253,7 +253,10 @@ prints whatever its own two stores hold, and nothing else.
 
 **The window is the intersection of the two spans.** A day only one store reaches cannot be
 called silent on both, so it is counted outside the window rather than judged; the two spans
-and the window are printed above the counts. `days_outside_window` carries the rest.
+and the window are printed above the counts, and the count of those days is its own line —
+`outside     25 day(s) are reached by only one store - not judged here` (synthetic figure) —
+because the four state counts add up to the window only, and the printed arithmetic would
+otherwise look complete while 25 days had been set aside.
 
 **Four states, four names, no zeros.** `measured` (both sides count), `activity without
 tokens` (receipt yes, transcripts no), `tokens without activity` (transcripts yes, the day

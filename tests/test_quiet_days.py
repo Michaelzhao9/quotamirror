@@ -250,3 +250,59 @@ def test_cli_quiet_prints_json_and_text(tmp_path, capsys):
     assert "2026-05-03" in text
     assert "no token record" in text
     assert "VERDICT: activity_without_tokens" in text
+
+
+def test_render_counts_the_days_only_one_store_reaches(tmp_path):
+    # The receipt reaches 05-01 and the transcripts reach 05-06, but neither
+    # store speaks for the day the other one alone records. Those days are
+    # counted in the payload, and a text reader has to see the count: the
+    # DAYS line adds up to days_in_window only, so without it the printed
+    # arithmetic silently looks complete.
+    scan = scan_of(
+        tmp_path,
+        {
+            "a.jsonl": [
+                usage_line("m1", "2026-05-04T10:00:00Z"),
+                usage_line("m2", "2026-05-06T10:00:00Z"),
+            ]
+        },
+    )
+    result = quotamirror.quiet_days(
+        cache_with([("2026-05-01", 400), ("2026-05-04", 400), ("2026-05-05", 400)]), scan
+    )
+
+    assert result["window"] == ["2026-05-04", "2026-05-05"]
+    assert result["days_outside_window"] == 2
+
+    text = quotamirror.render_quiet(result)
+    outside = [line for line in text.splitlines() if "outside" in line]
+    assert len(outside) == 1
+    assert "2 day(s)" in outside[0]
+    assert "not judged" in outside[0]
+
+
+def test_cli_quiet_prints_the_outside_count(tmp_path, capsys):
+    root = tmp_path / "transcripts"
+    root.mkdir()
+    lines = [
+        usage_line("m1", "2026-05-04T10:00:00Z"),
+        usage_line("m2", "2026-05-06T10:00:00Z"),
+    ]
+    (root / "a.jsonl").write_text(
+        "".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8"
+    )
+    cache_path = tmp_path / "cache.json"
+    cache_path.write_text(
+        json.dumps(
+            cache_with([("2026-05-01", 400), ("2026-05-04", 400), ("2026-05-05", 400)])
+        ),
+        encoding="utf-8",
+    )
+
+    code = quotamirror.main(
+        ["quiet", "--path", str(cache_path), "--transcripts", str(root)]
+    )
+    assert code == 0
+    text = capsys.readouterr().out
+    assert "outside" in text
+    assert "2 day(s)" in text

@@ -4435,6 +4435,10 @@ def render_quiet(payload):
         f"tokens without activity {payload['days_tokens_only']} | "
         f"silent {payload['days_silent']}"
     )
+    lines.append(
+        f"  outside     {payload['days_outside_window']} day(s) are reached by only one store "
+        "- not judged here"
+    )
     gaps = [row for row in payload["rows"] if row["kind"] != "silent"]
     if gaps:
         lines.append("")
