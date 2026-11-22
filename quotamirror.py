@@ -10,7 +10,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 TOKEN_BUCKETS = (
     "inputTokens",
@@ -4210,6 +4210,298 @@ def transcript_window(root, max_files=None):
     }
 
 
+RECENT_DAYS_DEFAULT = 7
+
+
+def recent_window(root, days=RECENT_DAYS_DEFAULT, until=None, max_files=None):
+    """Tokens inside a declared trailing window, placed by a recorded day.
+
+    Every other command measures the whole store (`nested`), the whole receipt
+    (`scan`) or a pair of windows (`compare`). The question a quota asks is
+    narrower - "the last N days" - and it has three ways to be answered wrongly:
+
+    * a window placed by the clock. If the newest record is three weeks old, a
+      "last 7 days" window computed from today is empty, and an empty window
+      reads as zero usage. Here the anchor is the newest *recorded* day unless
+      `--until` supplies one, and the payload says which it was.
+    * a total that hides the days it does not cover. A day inside the window
+      with no record makes the sum a floor; the count of those days is printed
+      with the total, not left to be inferred from a coverage line elsewhere.
+    * records with no timestamp. They belong to no window, so they are counted
+      as tokens *outside* it instead of being dropped from a total the reader
+      is told is complete.
+
+    The merge rule is `scan_usage`'s, so this window and `nested`'s lifetime
+    total cannot disagree about the same corpus. Nothing is written.
+    """
+    if days is None or int(days) < 1:
+        raise ValueError("--days must be at least 1")
+    days = int(days)
+    given_anchor = date.fromisoformat(until) if until is not None else None
+
+    scan = scan_usage(root, max_files=max_files)
+    observation = _observation(scan["files"], scan["records"])
+    payload = {
+        "root": scan["root"],
+        "files": len(scan["files"]),
+        "files_skipped": scan["files_skipped"] + scan["skipped_lines"],
+        "records": scan["records"],
+        "messages": scan["messages"],
+        "observation": observation,
+        "days_requested": days,
+        "dedupe": scan["dedupe"],
+        "day_attribution": scan["day_attribution"],
+    }
+
+    if observation["verdict"] != "usage_observed":
+        # Zero files read, or files that carried no usage: no day can place a
+        # window, and a total here would be a claim about nothing read.
+        payload.update(
+            {
+                "verdict": "unobserved",
+                "reason": observation["verdict"],
+                "window": None,
+                "anchor": None,
+                "total_tokens": None,
+                "tokens": None,
+                "rows": [],
+                "share_basis": None,
+                "raw_record_sum": None,
+                "days_with_records": None,
+                "missing_days": [],
+                "missing_count": None,
+                "floor": None,
+                "outside_window": None,
+            }
+        )
+        return payload
+
+    day_tables = scan["days"]
+    if given_anchor is not None:
+        last = given_anchor
+        source = "given"
+    else:
+        last = max(date.fromisoformat(day) for day in day_tables)
+        source = "record"
+    first = last - timedelta(days=days - 1)
+
+    tokens = {bucket: 0 for bucket in CLAUDE_TOKEN_BUCKETS}
+    by_model = {}
+    non_cache_by_model = {}
+    raw_record_sum = 0
+    days_with_records = 0
+    missing = []
+    for offset in range(days):
+        day = (first + timedelta(days=offset)).isoformat()
+        table = day_tables.get(day)
+        if table is None:
+            missing.append(day)
+            continue
+        days_with_records += 1
+        raw_record_sum += table["naive_tokens"]
+        for bucket in CLAUDE_TOKEN_BUCKETS:
+            tokens[bucket] += table["by_bucket"][bucket]
+        for model, per_model in table["by_model"].items():
+            by_model[model] = by_model.get(model, 0) + per_model["total_tokens"]
+            # the share is taken over non-cache-read tokens, so the numerator must
+            # use the same basis as the denominator or the percentages do not sum
+            non_cache_by_model[model] = non_cache_by_model.get(model, 0) + sum(
+                per_model["by_bucket"][bucket] for bucket in NON_CACHE_BUCKETS
+            )
+
+    tokens_before = 0
+    days_before = 0
+    tokens_after = 0
+    days_after = 0
+    for day, table in day_tables.items():
+        if day < first.isoformat():
+            days_before += 1
+            tokens_before += table["total_tokens"]
+        elif day > last.isoformat():
+            # `--until` can put real days on the far side of the window; they are
+            # outside it exactly like the days before, and must be counted there
+            days_after += 1
+            tokens_after += table["total_tokens"]
+
+    total = sum(tokens.values())
+    share_total = sum(tokens[bucket] for bucket in NON_CACHE_BUCKETS)
+    rows = []
+    for model, model_tokens in sorted(by_model.items(), key=lambda item: (-item[1], item[0])):
+        rows.append(
+            {
+                "model": model,
+                "total_tokens": model_tokens,
+                "share_tokens": non_cache_by_model.get(model, 0),
+                "share_pct": round(non_cache_by_model.get(model, 0) * 100.0 / share_total, 1)
+                if share_total
+                else None,
+                "of_tokens": share_total,
+            }
+        )
+
+    from_outside = scan["unattributed_tokens"]
+    payload.update(
+        {
+            "verdict": "window_measured" if days_with_records else "no_records_in_window",
+            "reason": None,
+            "anchor": {"day": last.isoformat(), "source": source},
+            "window": {
+                "first": first.isoformat(),
+                "last": last.isoformat(),
+                "days": days,
+                "basis": "record_timestamp",
+            },
+            "total_tokens": total,
+            "tokens": tokens,
+            "rows": rows,
+            "share_basis": {"name": "non_cache_read_tokens", "tokens": share_total},
+            "raw_record_sum": raw_record_sum,
+            "days_with_records": days_with_records,
+            "missing_days": missing,
+            "missing_count": len(missing),
+            "floor": bool(missing) and bool(days_with_records),
+            "outside_window": {
+                "records_without_timestamp": scan["records_without_timestamp"],
+                "tokens_without_timestamp": from_outside,
+                "days_before_window": days_before,
+                "tokens_before_window": tokens_before,
+                "days_after_window": days_after,
+                "tokens_after_window": tokens_after,
+                "tokens": from_outside + tokens_before + tokens_after,
+            },
+        }
+    )
+    return payload
+
+
+def _bucket_text(tokens):
+    labels = {
+        "input_tokens": "input",
+        "output_tokens": "output",
+        "cache_creation_input_tokens": "cache_creation",
+        "cache_read_input_tokens": "cache_read",
+    }
+    return ", ".join(f"{labels[bucket]} {tokens[bucket]:,}" for bucket in CLAUDE_TOKEN_BUCKETS)
+
+
+def render_recent_window(payload):
+    """The printed form: what was read, where the window sits, and what it excludes."""
+    out = ["RECENT WINDOW  (tokens inside a declared trailing window)"]
+    out.append(f"  source        : {payload.get('source') or payload.get('root')}")
+    dedupe = ""
+    if payload["messages"] is not None:
+        dedupe = f" -> {payload['messages']:,} after dedupe by message id"
+    records = payload["records"] if payload["records"] is not None else 0
+    out.append(f"  transcripts   : {payload['files']} file(s), {records:,} usage record(s){dedupe}")
+    out.append(_observation_line(payload["observation"]))
+
+    if payload["window"] is None:
+        out.append(
+            f"  window        : not measured ({payload['reason']} -- no usage record was read, "
+            "so no day can place a window)"
+        )
+        out.append("")
+        out.append(f"VERDICT: {payload['verdict']}")
+        out.append(
+            "  An empty store is an absence of observation, not an observation of zero usage:"
+        )
+        out.append("  nothing here says what was used in the last few days, and no total is printed.")
+        return "\n".join(out) + "\n"
+
+    window = payload["window"]
+    anchor = payload["anchor"]
+    out.append(f"  window        : {window['first']}..{window['last']} ({window['days']} day(s), basis={window['basis']})")
+    if anchor["source"] == "given":
+        out.append(
+            f"  anchor        : {anchor['day']} (given, not measured -- no record has to exist on this day)"
+        )
+    else:
+        out.append(
+            f"  anchor        : last recorded day {anchor['day']} (measured from the records this run read)"
+        )
+    out.append("")
+    out.append("TOKENS IN THE WINDOW (deduped by message id, larger value per bucket)")
+
+    if payload["rows"]:
+        width = max([len(row["model"]) for row in payload["rows"]] + [len("TOTAL")])
+        for row in payload["rows"]:
+            share = (
+                f"{row['share_pct']:5.1f}% of {row['of_tokens']:,} non_cache_read_tokens"
+                if row["share_pct"] is not None
+                else "share not measured -- the share basis is zero"
+            )
+            out.append(f"  {row['model']:<{width}}  {row['total_tokens']:>16,}  {share}")
+        out.append(f"  {'TOTAL':<{width}}  {payload['total_tokens']:>16,}")
+    else:
+        out.append(f"  {'TOTAL':<8}  {payload['total_tokens']:>16,}")
+    out.append(f"  buckets: {_bucket_text(payload['tokens'])}")
+    if payload["tokens"]["cache_read_input_tokens"] and payload["share_basis"]["tokens"]:
+        read_share = payload["tokens"]["cache_read_input_tokens"] * 100.0 / (
+            payload["share_basis"]["tokens"] + payload["tokens"]["cache_read_input_tokens"]
+        )
+        out.append(
+            f"  cache_read is outside the share basis: {payload['tokens']['cache_read_input_tokens']:,} "
+            f"= {read_share:.1f}% of this window's tokens and would drown every other bucket"
+        )
+    if payload["raw_record_sum"] and payload["raw_record_sum"] != payload["total_tokens"]:
+        extra = payload["raw_record_sum"] - payload["total_tokens"]
+        pct = extra * 100.0 / payload["total_tokens"] if payload["total_tokens"] else None
+        line = f"  raw record sum: {payload['raw_record_sum']:,} ({extra:,} above the deduped total"
+        line += f" = {pct:.1f}%" if pct is not None else ""
+        out.append(line + "; repeated writes of one message, so neither is interchangeable with the other)")
+
+    out.append("")
+    out.append("COVERAGE")
+    if payload["floor"]:
+        out.append(
+            f"  {payload['days_with_records']} of {payload['days_requested']} day(s) in the window carry a "
+            f"record; the total is a floor for those {payload['days_requested']} days, not a full-window measurement"
+        )
+        shown = payload["missing_days"][:8]
+        more = payload["missing_count"] - len(shown)
+        line = f"  no record: {', '.join(shown)}"
+        line += f" +{more} more" if more > 0 else ""
+        out.append(line)
+    elif payload["verdict"] == "no_records_in_window":
+        out.append(
+            "  no record falls inside the window; this zero is an absence of records, not a measured quiet period"
+        )
+    else:
+        out.append(
+            f"  every one of {payload['days_requested']} day(s) in the window carries a record, so the total "
+            "covers the window without a gap"
+        )
+    outside = payload["outside_window"]
+    out.append(
+        f"  {outside['tokens']:,} token(s) are outside the window: {outside['tokens_without_timestamp']:,} in "
+        f"{outside['records_without_timestamp']} record(s) with no timestamp, {outside['tokens_before_window']:,} "
+        f"on {outside['days_before_window']} day(s) before it, {outside['tokens_after_window']:,} on "
+        f"{outside['days_after_window']} day(s) after it"
+    )
+    out.append("")
+    verdict = payload["verdict"] + (" (floor)" if payload["floor"] else "")
+    out.append(f"VERDICT: {verdict}")
+    if payload["floor"]:
+        out.append(
+            "  Days with no record are counted, not assumed quiet: the meter may not have written them, "
+            "and this command cannot tell a quiet day from a missing one."
+        )
+    else:
+        out.append("  Every day in the window carries a recorded total; nothing here is interpolated.")
+    out.append("")
+    out.append(
+        "LIMIT: the window is placed by the newest recorded day, not by the clock, so a store whose newest"
+    )
+    out.append(
+        "record is three weeks old reports three weeks ago instead of an empty last week."
+    )
+    out.append(
+        "LIMIT: no price and no quota ceiling is assumed -- this is a token count inside a named window,"
+    )
+    out.append("not a fraction of a plan allowance.")
+    return "\n".join(out) + "\n"
+
+
 DEFAULT_MIN_TOKENS = 1_000_000
 DEFAULT_TOLERANCE = 0.02
 
@@ -4696,6 +4988,7 @@ def start_report(path):
 START_COMMANDS = (
     ("scan", "lifetime tokens per model, and every place a dollar figure is a placeholder"),
     ("units", "fields that are zero on every model while tokens are not"),
+    ("recent", "tokens in the last N days, with the days that carry no record named"),
     ("nested", "the same totals split by scope (reads ~/.claude/projects)"),
     ("compare", "two counters side by side (also needs Codex rollouts)"),
 )
@@ -4815,6 +5108,47 @@ def main(argv=None):
     revise.add_argument(
         "--no-record", action="store_true", help="compare without recording this reading"
     )
+    recent = sub.add_parser(
+        "recent",
+        help=(
+            "tokens inside a declared trailing window placed by a recorded day (last N days; "
+            "a floor, not a full-window bill, when days are missing)"
+        ),
+        add_help=False,
+    )
+    recent_input = recent.add_argument_group(
+        "input", "the transcript directory and how much of it is read"
+    )
+    recent_place = recent.add_argument_group("window", "where the trailing window sits")
+    recent_output = recent.add_argument_group("output", "what the command prints")
+    recent_general = recent.add_argument_group("options")
+    recent_general.add_argument("-h", "--help", action="help", help="show this help message and exit")
+    _add_path_arg(
+        recent_input,
+        Path.home() / ".claude" / "projects",
+        "the transcript directory to measure",
+    )
+    recent_input.add_argument(
+        "--max-files",
+        type=int,
+        default=None,
+        help="only the newest N transcripts (default: None -- every transcript is read)",
+    )
+    recent_place.add_argument(
+        "--days",
+        type=int,
+        default=RECENT_DAYS_DEFAULT,
+        help=f"window length in days, inclusive of the anchor day (default: {RECENT_DAYS_DEFAULT})",
+    )
+    recent_place.add_argument(
+        "--until",
+        default=None,
+        help=(
+            "YYYY-MM-DD anchor for the last day of the window (default: None -- the newest recorded "
+            "day is used, so the clock never places the window)"
+        ),
+    )
+    recent_output.add_argument("--json", action="store_true", help="machine-readable payload")
     nested = sub.add_parser(
         "nested",
         help=(
@@ -4921,6 +5255,29 @@ def main(argv=None):
         except ValueError as exc:
             print(f"quotamirror: {exc}", file=sys.stderr)
             return 2
+
+    if args.command == "recent":
+        root = Path(args.path)
+        if not root.exists():
+            print(f"quotamirror: no transcripts at {root}", file=sys.stderr)
+            return 2
+        if args.days < 1:
+            print("quotamirror: --days must be at least 1", file=sys.stderr)
+            return 2
+        if args.until is not None:
+            try:
+                date.fromisoformat(args.until)
+            except ValueError:
+                print(f"quotamirror: --until must be YYYY-MM-DD, got {args.until!r}", file=sys.stderr)
+                return 2
+        payload = recent_window(root, days=args.days, until=args.until, max_files=args.max_files)
+        payload["source"] = str(root)
+        payload = redact_home(payload)
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            sys.stdout.write(render_recent_window(payload))
+        return 0
 
     if args.command == "nested":
         root = Path(args.path)

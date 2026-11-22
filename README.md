@@ -49,6 +49,7 @@ quotamirror - what is on this machine
 START WITH
   scan     lifetime tokens per model, and every place a dollar figure is a placeholder
   units    fields that are zero on every model while tokens are not
+  recent   tokens in the last N days, with the days that carry no record named
   nested   the same totals split by scope (reads ~/.claude/projects)
   compare  two counters side by side (also needs Codex rollouts)
   --help   every command, every flag
@@ -174,6 +175,39 @@ With `--claude-transcripts`, the CLAUDE section prints the same `observation` li
 
 Without the flag the line reads `not_read` and names the flag that would measure it, so the three zeros (unread, empty store, no usage records) never look alike.
 
+### `recent` — tokens inside a declared trailing window
+
+```bash
+python3 quotamirror.py recent
+python3 quotamirror.py recent --days 30
+python3 quotamirror.py recent --until 2026-10-31 --days 7
+python3 quotamirror.py recent --json
+```
+
+Answers the "last N days" question without the three ways it is usually answered wrongly.
+
+**The window is placed by a record, not by the clock.** The anchor is the newest day the
+transcripts carry; `--until` supplies one instead, and the printed line says which
+(`measured from the records this run read` vs `given, not measured`). A store whose newest
+record is three weeks old therefore reports three weeks ago, instead of a "last 7 days"
+window computed from today that would be empty — and an empty window reads as zero usage.
+
+**A day with no record makes the total a floor, and the floor is printed.** The count of
+days inside the window that carry no record is on the same line as the total
+(`5 of 7 day(s) in the window carry a record; the total is a floor for those 7 days`), with
+the missing dates listed. `VERDICT: window_measured (floor)`. A quiet day and a day the
+meter never wrote look identical here, and the command says so rather than picking one.
+
+**Records with no timestamp belong to no window.** Their tokens are counted as *outside*
+the window, beside the tokens on days before and after it, so the total is never presented
+as the whole store. On the corpus this was built against that line carries 46 earlier days.
+
+Per-model rows share one basis — non-cache-read tokens, named on every row — and `cache_read`
+is printed inside the window but outside the share, with its share of the window beside it.
+The raw record sum is printed next to the deduped total when repeated writes of one message
+inflate it. Merge rule and day attribution are `nested`'s, so this window and that lifetime
+total cannot disagree about the same corpus (there is a test that reads both and subtracts).
+
 ### `nested` — root and subagent scope
 
 ```bash
@@ -261,9 +295,13 @@ Individual commands may expose additional refusal states in their JSON payloads;
 uv run --with pytest pytest -q
 ```
 
-The suite covers receipt reconciliation, unit and cumulative checks, loop deduplication, schema drift, two-reading revisions, cross-harness witnesses, polling shares, nested scope, day-level cross-checks, arbitration between record-sum and message-id-merged totals, that every command can format its own `--help`, and that every option carries a description naming its own default.
+The suite covers receipt reconciliation, unit and cumulative checks, loop deduplication, schema drift, two-reading revisions, cross-harness witnesses, polling shares, nested scope, trailing-window tokens (including agreement with `nested` on the same corpus), day-level cross-checks, arbitration between record-sum and message-id-merged totals, that every command can format its own `--help`, and that every option carries a description naming its own default.
 
 ## Limitations
+
+- `recent` places its window by the newest recorded day, so it measures the last N days *of the store*, not the last N days of wall-clock time; a store that stopped being written three weeks ago reports three weeks ago. Use `--until` to place the window where you meant it, and read the anchor line to see which was used.
+- `recent` cannot tell a quiet day from a day the meter failed to write: both are days with no record, both make the total a floor, and both are listed as `no record`.
+- `recent` measures tokens, never a share of a plan allowance: no quota ceiling is in the store, and none is assumed.
 
 - Receipt field names and shapes are harness-specific and can change.
 - Token values are trusted as written; this is not provider-side billing verification.
