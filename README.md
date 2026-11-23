@@ -253,7 +253,7 @@ number the receipt in hand carries, so the row says whose number it is:
     transcripts as written  2,800,000  (every usage record)
     transcripts deduped     1,260,000  (one message counted once)
     receipt / as written 1.46x | receipt / deduped 3.24x
-    per day      0 of 24 day(s) agree with their own pair (tolerance 2%) | 24 receipt-heavy, 0 transcript-heavy | widest 3.10x (2026-09-03), narrowest 1.20x (2026-08-21) -- no_agreement
+    per day      0 of 24 day(s) agree with their own pair (tolerance 2%) | 24 receipt-heavy, 0 transcript-heavy | widest 4.20x (2026-09-03), narrowest 2.10x (2026-08-21) -- no_agreement
   meter check: neither -- neither transcript figure is within tolerance of the receipt, so repeated writes do not account for the gap on their own and the remainder is not explained here
 
   one side holds a record, the other does not:
