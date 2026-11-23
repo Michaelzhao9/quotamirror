@@ -4301,6 +4301,12 @@ def _quiet_meter_check(
         "transcript_record_sum": None,
         "ratio_deduped": None,
         "ratio_record_sum": None,
+        "per_day_verdict": "not_measured",
+        "days_matching_individually": None,
+        "days_receipt_heavy": None,
+        "days_transcript_heavy": None,
+        "max_day_ratio": None,
+        "min_day_ratio": None,
         "reason": None,
     }
     if not billed_days:
@@ -4390,6 +4396,52 @@ def _quiet_meter_check(
             "neither transcript figure is within tolerance of the receipt, so repeated writes do "
             "not account for the gap on their own and the remainder is not explained here"
         )
+
+    # The two sums above are taken over the same days, which is weaker than it
+    # looks: a receipt-heavy day and a transcript-heavy day can cancel exactly,
+    # leaving the ratio at 1.00 while no day agrees. So each deciding day is
+    # also compared with its own pair, and a cancelled-out aggregate is not
+    # upgraded to agreement.
+    matched_axes = []
+    if written_hit:
+        matched_axes.append(transcript_written)
+    if deduped_hit:
+        matched_axes.append(transcript_days)
+    axes = matched_axes or [transcript_days]
+    per_day_tolerance = tol
+    agreeing = 0
+    for day in deciding:
+        if all(
+            abs((billed_days[day] or 0) / axis[day] - 1) <= per_day_tolerance
+            for axis in axes
+            if axis.get(day)
+        ):
+            agreeing += 1
+    heavy = sum(
+        1 for day in deciding if billed_days[day] > transcript_days[day] * (1 + tol)
+    )
+    light = sum(
+        1 for day in deciding if billed_days[day] < transcript_days[day] * (1 - tol)
+    )
+    day_ratios = [(billed_days[day] / transcript_days[day], day) for day in deciding]
+    block["days_matching_individually"] = agreeing
+    block["days_receipt_heavy"] = heavy
+    block["days_transcript_heavy"] = light
+    block["max_day_ratio"] = round(max(day_ratios)[0], 4)
+    block["min_day_ratio"] = round(min(day_ratios)[0], 4)
+    block["max_day"] = max(day_ratios)[1].isoformat()
+    block["min_day"] = min(day_ratios)[1].isoformat()
+    if agreeing == len(deciding):
+        block["per_day_verdict"] = "every_day_agrees"
+    elif written_hit or deduped_hit:
+        block["per_day_verdict"] = "aggregate_only"
+        block["reason"] += (
+            f"; day by day only {agreeing} of {len(deciding)} pair(s) agree "
+            f"({heavy} receipt-heavy, {light} transcript-heavy), so the matching total is an "
+            "aggregate result and not evidence that both meters count the same thing daily"
+        )
+    else:
+        block["per_day_verdict"] = "no_agreement"
     return block
 
 
@@ -4715,6 +4767,18 @@ def render_quiet(payload):
             ratios.append(f"receipt / deduped {block['ratio_deduped']:.2f}x")
         if ratios:
             lines.append("    " + " | ".join(ratios))
+        if block.get("days_matching_individually") is not None:
+            # The aggregate can match while no single day does, so the pairs are
+            # printed beside it rather than implied by it.
+            lines.append(
+                f"    per day      {block['days_matching_individually']} of "
+                f"{block['days_compared']} day(s) agree with their own pair "
+                f"(tolerance {block['tolerance']:.0%}) | "
+                f"{block['days_receipt_heavy']} receipt-heavy, "
+                f"{block['days_transcript_heavy']} transcript-heavy | "
+                f"widest {block['max_day_ratio']:.2f}x ({block['max_day']}), narrowest "
+                f"{block['min_day_ratio']:.2f}x ({block['min_day']}) -- {block['per_day_verdict']}"
+            )
     lines.append(f"  meter check: {block.get('verdict')} -- {block.get('reason')}")
     lines.append(
         f"  outside     {payload['days_outside_window']} day(s) are reached by only one store "
