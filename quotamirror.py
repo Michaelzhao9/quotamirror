@@ -4271,7 +4271,129 @@ def _receipt_token_table(cache):
     return table
 
 
-def quiet_days(cache, scan):
+def _quiet_meter_check(
+    billed_days, transcript_days, transcript_written, window, floor, tol, written_unknown=()
+):
+    """Do the two token meters count the same thing, or only the same days?
+
+    `quiet` prints the receipt's in-window total beside the transcripts' total.
+    A reader will subtract them, so the difference has to be measured rather
+    than named. Both stores can differ in one mechanical way this machine can
+    see: a streamed response writes its usage record more than once, so the
+    transcripts hold a record sum (every write) and a deduped total (one
+    message, largest value per bucket).
+
+    The receipt's day table is compared against BOTH figures over the days both
+    meters state a number for. Three outcomes are allowed: the receipt matches
+    the record sum, it matches the deduped total, or it matches neither - and
+    in the last case no cause is claimed, because the numbers do not support
+    one. A day below the token floor is counted and does not vote.
+    """
+    block = {
+        "available": False,
+        "verdict": "not_measured",
+        "days_compared": 0,
+        "days_below_floor": 0,
+        "min_tokens": floor,
+        "tolerance": tol,
+        "receipt_tokens": None,
+        "transcript_deduped": None,
+        "transcript_record_sum": None,
+        "ratio_deduped": None,
+        "ratio_record_sum": None,
+        "reason": None,
+    }
+    if not billed_days:
+        block["verdict"] = "no_token_meter"
+        block["reason"] = (
+            "this receipt carries no per-day token table, so it states no number a transcript "
+            "total could be checked against"
+        )
+        return block
+
+    start = end = None
+    if window:
+        start, end = window
+    shared = [
+        day
+        for day, billed in billed_days.items()
+        if billed and transcript_days.get(day)
+        and (start is None or start <= day <= end)
+    ]
+    if not shared:
+        block["verdict"] = "no_shared_token_days"
+        block["reason"] = (
+            "no day is stated by both token meters inside the window, so the two totals cover "
+            "different days and cannot be compared"
+        )
+        return block
+
+    unknown = [day for day in shared if day in set(written_unknown)]
+    if unknown:
+        block["verdict"] = "no_record_sum"
+        block["reason"] = (
+            f"{len(unknown)} day(s) hold no record sum in the scan, so the receipt cannot be "
+            "checked against both transcript figures; the deduped total is not substituted for it"
+        )
+        return block
+
+    deciding = sorted(day for day in shared if billed_days[day] >= floor)
+    block["days_below_floor"] = len(shared) - len(deciding)
+    if not deciding:
+        block["verdict"] = "no_day_above_floor"
+        block["reason"] = (
+            f"{len(shared)} day(s) are stated by both token meters and every one is below "
+            f"{floor:,} token(s), so no day is large enough to decide anything"
+        )
+        return block
+
+    receipt = sum(billed_days[day] for day in deciding)
+    deduped = sum(transcript_days[day] for day in deciding)
+    written = sum((transcript_written or {}).get(day, 0) for day in deciding)
+    block["available"] = True
+    block["days_compared"] = len(deciding)
+    block["receipt_tokens"] = receipt
+    block["transcript_deduped"] = deduped
+    block["transcript_record_sum"] = written
+    if deduped:
+        block["ratio_deduped"] = round(receipt / deduped, 4)
+    if written:
+        block["ratio_record_sum"] = round(receipt / written, 4)
+
+    def _matches(ratio):
+        return ratio is not None and abs(ratio - 1) <= tol
+
+    deduped_hit = _matches(block["ratio_deduped"])
+    written_hit = _matches(block["ratio_record_sum"])
+    if deduped_hit and written_hit:
+        block["verdict"] = "both_match"
+        block["reason"] = (
+            "both transcript figures are within tolerance of the receipt, so on these days the "
+            "corpus holds no repeated write and the two stores agree on the amount"
+        )
+    elif written_hit:
+        block["verdict"] = "record_sum_matches"
+        block["reason"] = (
+            "the receipt's day table is the transcript record sum: the two sides count writes and "
+            "unique messages, so the gap is a repeated-write artifact and neither number is a "
+            "meter error"
+        )
+    elif deduped_hit:
+        block["verdict"] = "deduped_matches"
+        block["reason"] = (
+            "the receipt's day table matches the deduped transcript total, so the receipt counts "
+            "each message once and the repeated writes in the transcript corpus are not in it"
+        )
+    else:
+        block["verdict"] = "neither"
+        block["reason"] = (
+            "neither transcript figure is within tolerance of the receipt, so repeated writes do "
+            "not account for the gap on their own and the remainder is not explained here"
+        )
+    return block
+
+
+def quiet_days(cache, scan, min_tokens=None, tolerance=None):
     """Name the days each of two independent stores is silent on.
 
     `recent --by-day` can already say a day carries no token record. It cannot
@@ -4304,12 +4426,21 @@ def quiet_days(cache, scan):
     """
     activity = _receipt_day_table(cache)
     billed_days = _receipt_token_table(cache)
+    floor, tol = _floor(min_tokens, tolerance)
     transcript_days = {}
+    transcript_written = {}
+    written_unknown = set()
     for key, entry in ((scan or {}).get("days") or {}).items():
         day = _day_of(key)
         if day is None or not isinstance(entry, dict):
             continue
         tokens = int(entry.get("total_tokens") or 0)
+        if "naive_tokens" in entry:
+            transcript_written[day] = int(entry.get("naive_tokens") or 0)
+        else:
+            # Substituting the deduped total here would make both candidates
+            # the same number and turn a missing measurement into agreement.
+            written_unknown.add(day)
         if tokens:
             transcript_days[day] = tokens
 
@@ -4334,6 +4465,9 @@ def quiet_days(cache, scan):
         "receipt_tokens_billed": 0,
         "receipt_tokens_in_window": 0,
         "transcript_tokens_in_window": 0,
+        "arbitration": _quiet_meter_check(
+            billed_days, transcript_days, transcript_written, None, floor, tol, written_unknown
+        ),
         "rows": [],
     }
 
@@ -4394,6 +4528,9 @@ def quiet_days(cache, scan):
         return payload
 
     payload["window"] = [str(start), str(end)]
+    payload["arbitration"] = _quiet_meter_check(
+        billed_days, transcript_days, transcript_written, (start, end), floor, tol, written_unknown
+    )
     rows = []
     day = start
     while day <= end:
@@ -4549,8 +4686,36 @@ def render_quiet(payload):
     lines.append(
         f"  totals      receipt {_fmt(payload['receipt_tokens_in_window'])} | "
         f"transcripts {_fmt(payload['transcript_tokens_in_window'])} "
-        "-- the two sides are not reconciled here"
+        "-- the two sides are not the same measure"
     )
+    block = payload.get("arbitration") or {}
+    if block.get("available"):
+        # The pair of totals above invites a subtraction, so the difference is
+        # measured here instead of being left to the reader.
+        head = (
+            f"  meter check  {block['days_compared']} day(s) stated by both token meters "
+            f"(>= {block['min_tokens']:,}, tolerance {block['tolerance']:.0%})"
+        )
+        if block["days_below_floor"]:
+            head += f" | {block['days_below_floor']} day(s) below the floor do not vote"
+        lines.append(head)
+        lines.append(f"    receipt                 {_fmt(block['receipt_tokens'])}")
+        lines.append(
+            f"    transcripts as written  {_fmt(block['transcript_record_sum'])}  "
+            "(every usage record)"
+        )
+        lines.append(
+            f"    transcripts deduped     {_fmt(block['transcript_deduped'])}  "
+            "(one message counted once)"
+        )
+        ratios = []
+        if block.get("ratio_record_sum") is not None:
+            ratios.append(f"receipt / as written {block['ratio_record_sum']:.2f}x")
+        if block.get("ratio_deduped") is not None:
+            ratios.append(f"receipt / deduped {block['ratio_deduped']:.2f}x")
+        if ratios:
+            lines.append("    " + " | ".join(ratios))
+    lines.append(f"  meter check: {block.get('verdict')} -- {block.get('reason')}")
     lines.append(
         f"  outside     {payload['days_outside_window']} day(s) are reached by only one store "
         "- not judged here"
@@ -5621,6 +5786,7 @@ def main(argv=None):
     quiet.add_argument(
         "--max-files", type=int, default=None, help="only the newest N transcripts"
     )
+    _add_floor_args(quiet)
     quiet.add_argument("--json", action="store_true", help="machine-readable payload")
 
     nested = sub.add_parser(
@@ -5723,7 +5889,7 @@ def main(argv=None):
         payload = start_report(DEFAULT_CACHE)
         sys.stdout.write(render_start(payload))
         return 0 if payload["readable"] else 2
-    if args.command in {"nested", "compare"}:
+    if args.command in {"nested", "compare", "quiet"}:
         try:
             _floor(args.min_tokens, args.tolerance)
         except ValueError as exc:
@@ -5767,7 +5933,9 @@ def main(argv=None):
             print(f"quotamirror: no transcripts at {root}", file=sys.stderr)
             return 2
         scan = scan_usage(root, max_files=args.max_files)
-        payload = quiet_days(cache, scan)
+        payload = quiet_days(
+            cache, scan, min_tokens=args.min_tokens, tolerance=args.tolerance
+        )
         payload["source"] = str(Path(args.path).resolve())
         payload["transcript_root"] = str(root.resolve())
         payload["files"] = len(scan["files"])

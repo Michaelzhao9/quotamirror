@@ -247,7 +247,13 @@ number the receipt in hand carries, so the row says whose number it is:
 
 ```
   DAYS: measured 24 | receipt bills, transcripts silent 3 | activity without tokens 1 | tokens without activity 0 | silent 40
-  totals      receipt 5,040,000 | transcripts 1,260,000 -- the two sides are not reconciled here
+  totals      receipt 5,040,000 | transcripts 1,260,000 -- the two sides are not the same measure
+  meter check  24 day(s) stated by both token meters (>= 1,000,000, tolerance 2%)
+    receipt                 4,080,000
+    transcripts as written  2,800,000  (every usage record)
+    transcripts deduped     1,260,000  (one message counted once)
+    receipt / as written 1.46x | receipt / deduped 3.24x
+  meter check: neither -- neither transcript figure is within tolerance of the receipt, so repeated writes do not account for the gap on their own and the remainder is not explained here
 
   one side holds a record, the other does not:
     2026-09-03    900 message(s)  receipt bills 4,200 token(s)  transcripts hold none
@@ -258,6 +264,18 @@ hold. The billed tokens are counted separately (`receipt_tokens_billed`) and are
 into the transcript side; the verdict is `billed_without_transcripts`, because a transcript
 total inside such a window is a floor and not a measurement of it. A row that sums to zero, and
 a receipt with no such table, do not upgrade a day: a zero states nothing.
+
+**Two totals printed side by side invite a subtraction, so the difference is measured.** The
+transcript corpus can differ from the receipt in one mechanical way a reader can check: a
+streamed response may write its usage record more than once, so the same days hold a *record
+sum* (every write) and a *deduped* total (one message, largest value per bucket). The
+`meter check` block adds the receipt's own day table to both figures over the days both meters
+state a number for, prints all three and the two factors, and returns one of
+`record_sum_matches` / `deduped_matches` / `both_match` / `neither`. `neither` is a real
+answer: it says repeated writes do not account for the gap on their own and leaves the remainder
+unexplained rather than picking the nearest cause. Days below `--min-tokens` (default 1,000,000) are counted and do not
+vote; `--tolerance` (default 0.02) is the width that decides a match, and both numbers in force
+are printed with the verdict so the run can be repeated.
 
 **Five states, five names, no zeros.** `measured` (both sides count), `receipt bills,
 transcripts silent` (the receipt's token table states the day, the transcripts do not reach it),
@@ -382,7 +400,7 @@ The suite covers receipt reconciliation, unit and cumulative checks, loop dedupl
 
 - `recent` places its window by the newest recorded day, so it measures the last N days *of the store*, not the last N days of wall-clock time; a store that stopped being written three weeks ago reports three weeks ago. Use `--until` to place the window where you meant it, and read the anchor line to see which was used.
 - `recent` cannot tell a quiet day from a day the meter failed to write: both are days with no record, both make the total a floor, and both are printed as `no record`. `--by-day` makes each one visible as a row instead of a date in a comma list, and it makes a run of blank days obvious, but it cannot label them - a store only holds what it wrote, so a holiday and a broken meter leave the same shape. A truly empty window prints no total at all rather than `0`. `quiet` is the one place this is separated, and only where two independent stores both reach: a day the receipt counts messages on is not quiet, whatever the transcripts hold. Outside that intersection nothing is claimed.
-- `quiet` does not say *why* a day carries messages and no tokens. It now separates the days the receipt's own token table bills — the number is stated, the transcripts simply do not reach those days — from the days no table states a number for, and refuses to call either quiet. The cause itself (pruned transcripts, a client that writes none, an unmetered day) is still not decidable from the stores, and a transcript total over a window containing billed days is a floor: the two sides' totals are printed and never reconciled.
+- `quiet` does not say *why* a day carries messages and no tokens. It separates the days the receipt's own token table bills — the number is stated, the transcripts simply do not reach those days — from the days no table states a number for, and refuses to call either quiet. The cause itself (pruned transcripts, a client that writes none, an unmetered day) is still not decidable from the stores, and a transcript total over a window containing billed days is a floor. The `meter check` block does measure the *shape* of the gap on days both meters speak (record sum, deduped, or neither), but it can only rule the repeated-write explanation in or out — when it returns `neither`, the remaining factor is still unattributed, and this command names no cause for it.
 - `recent` measures tokens, never a share of a plan allowance: no quota ceiling is in the store, and none is assumed.
 
 - Receipt field names and shapes are harness-specific and can change.

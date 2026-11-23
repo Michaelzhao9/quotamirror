@@ -469,10 +469,11 @@ def test_token_rows_without_a_message_table_are_not_compared(tmp_path):
     assert "no dailyActivity" in result["reason"]
 
 
-def test_the_two_sides_totals_are_printed_and_not_reconciled(tmp_path):
+def test_the_two_sides_totals_are_printed_and_marked_as_different_measures(tmp_path):
     # "measured 30" says both stores hold a record on a day; it does not say
     # they agree on the amount. Printing one side's total alone lets the reader
-    # take it for the window's usage, so both are printed with the gap named.
+    # take it for the window's usage, so both are printed and the line says they
+    # are different measures - the meter check below says which, or neither.
     scan = scan_of(
         tmp_path,
         {
@@ -494,4 +495,9 @@ def test_the_two_sides_totals_are_printed_and_not_reconciled(tmp_path):
     assert len(totals) == 1
     assert "4,000" in totals[0]
     assert "1,000" in totals[0]
-    assert "not reconciled" in totals[0]
+    assert "not the same measure" in totals[0]
+    # The difference is now measured, not left to the reader: this fixture has
+    # one day below the default floor, so the check refuses to decide.
+    check = [line for line in text.splitlines() if line.strip().startswith("meter check:")]
+    assert len(check) == 1
+    assert "no_day_above_floor" in check[0]
