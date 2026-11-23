@@ -4271,8 +4271,153 @@ def _receipt_token_table(cache):
     return table
 
 
+def _receipt_model_table(cache):
+    """The receipt's per-day token totals split by model, keyed by date.
+
+    `_receipt_token_table` collapses the same rows to one number per day. This
+    keeps the names, because the meter check's other two axes sum every model
+    together and cannot say whether a gap lives in one model or in all of them.
+    A row that names no model, or a value that is not a number, is dropped
+    rather than coerced - an invented zero would read as a measured one.
+    """
+    table = {}
+    for row in cache.get("dailyModelTokens") or []:
+        if not isinstance(row, dict):
+            continue
+        day = _day_of(row.get("date"))
+        if day is None:
+            continue
+        by_model = row.get("tokensByModel")
+        if not isinstance(by_model, dict):
+            continue
+        split = {}
+        for name, value in by_model.items():
+            if not isinstance(name, str) or not name:
+                continue
+            try:
+                tokens = int(value or 0)
+            except (TypeError, ValueError):
+                continue
+            if tokens:
+                split[name] = tokens
+        if split:
+            table[day] = split
+    return table
+
+
+def _model_axis(billed_by_model, transcript_by_model, deciding, tol):
+    """Split the meter check's deciding days by model name.
+
+    The returned keys are prefixed `by_model_` on purpose: this dict is merged
+    into the meter check block, whose own `verdict` must not be overwritten by
+    a per-model one.
+
+    A model is compared only when both sides name it over the deciding days. A
+    model only one side names is listed, never counted as agreeing and never
+    dropped: a name mismatch and a model the other store does not meter leave
+    the same gap, and the two are indistinguishable from the numbers alone.
+    `largest_gap_share` is that model's share of the total positive excess, so
+    a gap spread across every model is distinguished from one that sits in a
+    single model.
+    """
+    fragment = {
+        "by_model_verdict": "not_measured",
+        "by_model_rows": [],
+        "models_compared": 0,
+        "models_agreeing": 0,
+        "models_receipt_heavy": 0,
+        "models_transcript_heavy": 0,
+        "largest_gap_model": None,
+        "largest_gap_share": None,
+        "models_receipt_only": [],
+        "models_transcript_only": [],
+        "model_ratio_min": None,
+        "model_ratio_max": None,
+    }
+    if not billed_by_model and not transcript_by_model:
+        return fragment
+    receipt = {}
+    transcript = {}
+    for day in deciding:
+        for name, tokens in (billed_by_model.get(day) or {}).items():
+            receipt[name] = receipt.get(name, 0) + tokens
+        for name, tokens in (transcript_by_model.get(day) or {}).items():
+            transcript[name] = transcript.get(name, 0) + tokens
+    if not receipt and not transcript:
+        return fragment
+    shared = sorted(
+        set(receipt) & set(transcript), key=lambda name: -receipt.get(name, 0)
+    )
+    for name in sorted(set(receipt) - set(transcript)):
+        fragment["models_receipt_only"].append(name)
+    for name in sorted(set(transcript) - set(receipt)):
+        fragment["models_transcript_only"].append(name)
+    rows = []
+    for name in shared:
+        billed = receipt[name]
+        written = transcript[name]
+        ratio = round(billed / written, 4) if written else None
+        if ratio is None:
+            verdict = "no_transcript_record"
+        elif abs(ratio - 1) <= tol:
+            verdict = "agree"
+        elif ratio > 1:
+            verdict = "receipt_heavy"
+        else:
+            verdict = "transcript_heavy"
+        rows.append(
+            {
+                "model": name,
+                "receipt_tokens": billed,
+                "transcript_tokens": written,
+                "ratio": ratio,
+                "verdict": verdict,
+            }
+        )
+    fragment["by_model_rows"] = rows
+    fragment["models_compared"] = len(rows)
+    fragment["models_agreeing"] = sum(1 for row in rows if row["verdict"] == "agree")
+    fragment["models_receipt_heavy"] = sum(
+        1 for row in rows if row["verdict"] == "receipt_heavy"
+    )
+    fragment["models_transcript_heavy"] = sum(
+        1 for row in rows if row["verdict"] == "transcript_heavy"
+    )
+    ratios = [row["ratio"] for row in rows if row["ratio"] is not None]
+    if ratios:
+        fragment["model_ratio_min"] = min(ratios)
+        fragment["model_ratio_max"] = max(ratios)
+    excess = [
+        (row["receipt_tokens"] - row["transcript_tokens"], row["model"])
+        for row in rows
+        if row["receipt_tokens"] > row["transcript_tokens"]
+    ]
+    if excess:
+        total = sum(amount for amount, _ in excess)
+        amount, name = max(excess)
+        fragment["largest_gap_model"] = name
+        fragment["largest_gap_share"] = round(amount / total, 4) if total else None
+    if not rows:
+        fragment["by_model_verdict"] = "no_shared_model"
+    elif fragment["models_agreeing"] == len(rows):
+        fragment["by_model_verdict"] = "every_model_agrees"
+    elif fragment["models_receipt_heavy"] == len(rows):
+        fragment["by_model_verdict"] = "every_model_receipt_heavy"
+    else:
+        fragment["by_model_verdict"] = "mixed"
+    return fragment
+
+
 def _quiet_meter_check(
-    billed_days, transcript_days, transcript_written, window, floor, tol, written_unknown=()
+    billed_days,
+    transcript_days,
+    transcript_written,
+    window,
+    floor,
+    tol,
+    written_unknown=(),
+    billed_by_model=None,
+    transcript_by_model=None,
 ):
     """Do the two token meters count the same thing, or only the same days?
 
@@ -4309,6 +4454,7 @@ def _quiet_meter_check(
         "min_day_ratio": None,
         "reason": None,
     }
+    block.update(_model_axis({}, {}, [], tol))
     if not billed_days:
         block["verdict"] = "no_token_meter"
         block["reason"] = (
@@ -4427,6 +4573,7 @@ def _quiet_meter_check(
     block["days_matching_individually"] = agreeing
     block["days_receipt_heavy"] = heavy
     block["days_transcript_heavy"] = light
+    block.update(_model_axis(billed_by_model or {}, transcript_by_model or {}, deciding, tol))
     block["max_day_ratio"] = round(max(day_ratios)[0], 4)
     block["min_day_ratio"] = round(min(day_ratios)[0], 4)
     block["max_day"] = max(day_ratios)[1].isoformat()
@@ -4478,15 +4625,29 @@ def quiet_days(cache, scan, min_tokens=None, tolerance=None):
     """
     activity = _receipt_day_table(cache)
     billed_days = _receipt_token_table(cache)
+    billed_by_model = _receipt_model_table(cache)
     floor, tol = _floor(min_tokens, tolerance)
     transcript_days = {}
     transcript_written = {}
+    transcript_by_model = {}
     written_unknown = set()
     for key, entry in ((scan or {}).get("days") or {}).items():
         day = _day_of(key)
         if day is None or not isinstance(entry, dict):
             continue
         tokens = int(entry.get("total_tokens") or 0)
+        split = {}
+        for name, model_entry in (entry.get("by_model") or {}).items():
+            if not isinstance(model_entry, dict):
+                continue
+            try:
+                model_tokens = int(model_entry.get("total_tokens") or 0)
+            except (TypeError, ValueError):
+                continue
+            if model_tokens:
+                split[name] = model_tokens
+        if split:
+            transcript_by_model[day] = split
         if "naive_tokens" in entry:
             transcript_written[day] = int(entry.get("naive_tokens") or 0)
         else:
@@ -4518,7 +4679,15 @@ def quiet_days(cache, scan, min_tokens=None, tolerance=None):
         "receipt_tokens_in_window": 0,
         "transcript_tokens_in_window": 0,
         "arbitration": _quiet_meter_check(
-            billed_days, transcript_days, transcript_written, None, floor, tol, written_unknown
+            billed_days,
+            transcript_days,
+            transcript_written,
+            None,
+            floor,
+            tol,
+            written_unknown,
+            billed_by_model,
+            transcript_by_model,
         ),
         "rows": [],
     }
@@ -4581,7 +4750,15 @@ def quiet_days(cache, scan, min_tokens=None, tolerance=None):
 
     payload["window"] = [str(start), str(end)]
     payload["arbitration"] = _quiet_meter_check(
-        billed_days, transcript_days, transcript_written, (start, end), floor, tol, written_unknown
+        billed_days,
+        transcript_days,
+        transcript_written,
+        (start, end),
+        floor,
+        tol,
+        written_unknown,
+        billed_by_model,
+        transcript_by_model,
     )
     rows = []
     day = start
@@ -4778,6 +4955,42 @@ def render_quiet(payload):
                 f"{block['days_transcript_heavy']} transcript-heavy | "
                 f"widest {block['max_day_ratio']:.2f}x ({block['max_day']}), narrowest "
                 f"{block['min_day_ratio']:.2f}x ({block['min_day']}) -- {block['per_day_verdict']}"
+            )
+        if block.get("by_model_rows"):
+            # Both axes above sum every model together, so a gap in one model
+            # and an opposite gap in another cancel there. This line splits the
+            # same days by name and says how much of the excess sits in one.
+            axis = (
+                f"    by model     {block['models_agreeing']} of {block['models_compared']} "
+                f"model(s) agree | {block['models_receipt_heavy']} receipt-heavy, "
+                f"{block['models_transcript_heavy']} transcript-heavy"
+            )
+            if block.get("model_ratio_min") is not None:
+                # One constant factor and a range of factors are different
+                # findings; the counts alone cannot tell them apart.
+                axis += (
+                    f" | ratio {block['model_ratio_min']:.2f}x..{block['model_ratio_max']:.2f}x"
+                )
+            if block.get("largest_gap_model"):
+                axis += (
+                    f" | largest gap {block['largest_gap_model']} "
+                    f"({block['largest_gap_share']:.0%} of the excess)"
+                )
+            axis += f" -- {block['by_model_verdict']}"
+            lines.append(axis)
+        if block.get("models_receipt_only") or block.get("models_transcript_only"):
+            sides = []
+            if block.get("models_receipt_only"):
+                sides.append(
+                    "receipt only: " + ", ".join(block["models_receipt_only"][:4])
+                )
+            if block.get("models_transcript_only"):
+                sides.append(
+                    "transcripts only: " + ", ".join(block["models_transcript_only"][:4])
+                )
+            lines.append(
+                "    one side only " + " | ".join(sides)
+                + " -- named by one store, counted by neither"
             )
     lines.append(f"  meter check: {block.get('verdict')} -- {block.get('reason')}")
     lines.append(
