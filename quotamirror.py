@@ -581,6 +581,40 @@ def render_cumulative(payload):
 
 def _attribution(cache, by_model):
     daily_per_model, _ = _daily_totals(cache)
+    rows_naming = {}
+    day_dates = []
+    for row in cache.get("dailyModelTokens") or []:
+        if not isinstance(row, dict):
+            continue
+        if _day_of(row.get("date")) is not None:
+            day_dates.append(str(row.get("date"))[:10])
+        for model, tokens in (row.get("tokensByModel") or {}).items():
+            if not isinstance(model, str) or not model:
+                continue
+            try:
+                int(tokens or 0)
+            except (TypeError, ValueError):
+                continue
+            rows_naming[model] = rows_naming.get(model, 0) + 1
+    activity_dates = sorted(day.isoformat() for day in _receipt_day_table(cache))
+    day_dates.sort()
+    day_table_first = day_dates[0] if day_dates else None
+    day_table_last = day_dates[-1] if day_dates else None
+    activity_first = activity_dates[0] if activity_dates else None
+    activity_last = activity_dates[-1] if activity_dates else None
+    # A day row for every day of use is what makes the per-day view a second
+    # lifetime total. When the table starts after the receipt's first activity
+    # row, the per-day figure is a floor over its own span, and the gap against
+    # the per-model view is an artefact of that span - not evidence that the two
+    # views disagree. The span is read from the receipt's own two tables, never
+    # assumed.
+    if day_table_first is None or activity_first is None:
+        span_verdict = "not_comparable"
+        days_before = 0
+    else:
+        days_before = sum(1 for day in activity_dates if day < day_table_first)
+        span_verdict = "day_view_is_a_floor" if days_before else "same_span"
+
     model_total = sum(m["tokens"] for m in by_model.values())
     daily_total = sum(daily_per_model.values())
 
@@ -592,12 +626,23 @@ def _attribution(cache, by_model):
         if seen_by_day == seen_by_model:
             reconciled += 1
             continue
+        presence = "day_rows" if rows_naming.get(model) else "no_day_row"
         gaps.append(
             {
                 "model": model,
                 "daily": seen_by_day,
                 "model_total": seen_by_model,
                 "gap": seen_by_model - seen_by_day,
+                "day_rows": rows_naming.get(model, 0),
+                # `no_day_row` is the absence of a row, which is not the same
+                # claim as a row that measured zero: only the second one is a
+                # measurement, and only one of them can be printed as a number.
+                "presence": presence,
+                "coverage": (
+                    round(seen_by_day / seen_by_model, 4)
+                    if seen_by_model and presence == "day_rows"
+                    else None
+                ),
             }
         )
     gaps.sort(key=lambda g: abs(g["gap"]), reverse=True)
@@ -610,7 +655,18 @@ def _attribution(cache, by_model):
         "gap_share": (abs(gap) / model_total) if model_total else 0.0,
         "reconciled_models": reconciled,
         "models_compared": len(set(by_model) | set(daily_per_model)),
+        "gap_models": len(gaps),
+        "gap_models_without_day_rows": sum(
+            1 for g in gaps if g["presence"] == "no_day_row"
+        ),
         "gaps": gaps,
+        "day_table_first": day_table_first,
+        "day_table_last": day_table_last,
+        "activity_first": activity_first,
+        "activity_last": activity_last,
+        "days_before_day_table": days_before,
+        "day_table_truncated": span_verdict == "day_view_is_a_floor",
+        "span_verdict": span_verdict,
     }
 
 def _fmt(n):
@@ -693,16 +749,41 @@ def render_text(payload, source="(unknown)"):
             f"  {attribution['reconciled_models']} of {attribution['models_compared']} "
             "models reconcile"
         )
+        if attribution.get("span_verdict") == "day_view_is_a_floor":
+            lines.append(
+                f"  {attribution['days_before_day_table']} day(s) of activity sit before "
+                f"the day table ({attribution['day_table_first']}); the per-day view is a "
+                "floor over the days it covers, not a second lifetime total"
+            )
+        elif attribution.get("span_verdict") == "same_span":
+            lines.append(
+                f"  day table and activity rows both start {attribution['day_table_first']} "
+                "- the two views cover the same span"
+            )
+        else:
+            lines.append(
+                "  span not comparable - the receipt holds no activity row, so there is "
+                "no first day to compare the day table against"
+            )
     else:
         lines.append(
             "  not comparable - the receipt carries no modelUsage entries, so there is "
             "only one view here; nothing can be said about a gap"
         )
     for gap in attribution["gaps"]:
-        lines.append(
-            f"    {gap['model']:<26} daily {_fmt(gap['daily']):>12}  "
-            f"model {_fmt(gap['model_total']):>14}  gap {_fmt(gap['gap']):>14}"
-        )
+        if gap.get("presence") == "no_day_row":
+            lines.append(
+                f"    {gap['model']:<26} no day row  "
+                f"model {_fmt(gap['model_total']):>14}  gap {_fmt(gap['gap']):>14}"
+            )
+        else:
+            coverage = gap.get("coverage")
+            share = f" ({coverage * 100:.2f}%)" if coverage is not None else ""
+            lines.append(
+                f"    {gap['model']:<26} "
+                f"{_fmt(gap['daily'])} of {_fmt(gap['model_total'])}{share}  "
+                f"gap {_fmt(gap['gap']):>14}"
+            )
     lines.append("")
 
     coverage = payload["coverage"]

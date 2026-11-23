@@ -81,6 +81,21 @@ days at all no longer claims every activity day has a token record. When the day
 (`dailyModelTokens`) does hold tokens, `scan` prints that sum with its day count next
 to the refusal, labelled as a lower bound rather than the lifetime total.
 
+A signed gap between the two lifetime views is only readable if the per-day view covers
+the same span. `scan` measures that span from the receipt's own two day tables and prints
+it with the gap: when the token table starts after the first activity row, the per-day
+figure is called a floor over the days it covers and the number of leading activity days
+is named. Each gap model also prints how many day rows name it and what share of its total
+those rows account for, so `300 of 200,000 (0.15%)` and a model the token table
+never mentions read differently. That second model prints `no day row`, not `daily 0`: an
+absent row is not a row that measured zero. JSON gains `attribution.span_verdict`
+(`day_view_is_a_floor`, `same_span`, `not_comparable`), `days_before_day_table`,
+`day_table_first`, `gap_models`, `gap_models_without_day_rows`, and per gap `presence`,
+`day_rows` and `coverage` (`null` when no row names the model). Nothing outside the
+receipt is consulted: a store that holds no per-day record before the table's first date
+cannot make that period measurable, so the span is reported as covered or not covered,
+never estimated.
+
 ### `units` — audit magnitude and counter shape
 
 ```bash

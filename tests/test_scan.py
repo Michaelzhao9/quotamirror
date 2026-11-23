@@ -105,9 +105,16 @@ def test_gap_between_daily_view_and_model_view_is_reported_per_model():
     assert attribution["daily_total"] == 500
     assert attribution["model_total"] == 600
     assert attribution["gap"] == 100
-    assert attribution["gaps"] == [
-        {"model": "claude-opus", "daily": 400, "model_total": 500, "gap": 100}
-    ]
+    row = attribution["gaps"][0]
+    assert {k: row[k] for k in ("model", "daily", "model_total", "gap")} == {
+        "model": "claude-opus",
+        "daily": 400,
+        "model_total": 500,
+        "gap": 100,
+    }
+    assert row["presence"] == "day_rows"
+    assert row["day_rows"] == 1
+    assert row["coverage"] == 0.8
 
 
 def test_models_whose_two_views_agree_are_counted_as_reconciled():
@@ -139,6 +146,8 @@ def test_a_model_present_only_in_the_model_view_is_an_unattributed_gap():
 
     assert attribution["gaps"][0]["model"] == "claude-sonnet"
     assert attribution["gaps"][0]["daily"] == 0
+    assert attribution["gaps"][0]["presence"] == "no_day_row"
+    assert attribution["gaps"][0]["coverage"] is None
     assert attribution["gap"] == 294_166 - 1000
 
 
