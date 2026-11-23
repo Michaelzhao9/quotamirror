@@ -320,6 +320,30 @@ reports the hole instead of choosing a cause. On the corpus this was built again
 agrees and every one is receipt-heavy, with the factor varying by model: the residual is not
 one model's artifact, and it is still not attributed here.
 
+**The ratio divides by the records that survive, so it says which days still have evidence.**
+A factor computed against a corpus that lost records is not a meter factor. The `witness` line
+therefore asks a different question of every day the receipt bills: does the corpus still hold
+the usage records behind that day's total? Three answers are counted and kept apart —
+`exact` (the receipt's day total equals the sum of the records, so the day is witnessed and the
+two stores agree on it), `short` (the corpus holds some records and fewer tokens than the
+receipt states, so that day's evidence is incomplete), and `absent` (no record at all: the
+receipt states a number nothing on this machine can check). A fourth, `over`, covers the
+opposite direction — the corpus heavier than the receipt — and is never folded into the
+evidence holes, because that is a real disagreement and not a missing measurement. The line
+prints each count with its billed tokens, the missing amount behind the short days,
+`checked X% of N billed tokens`, and the widest short day with its factor:
+
+```
+    witness      2 day(s) exact | 1 short (1,000,000 billed, 800,000 missing) | 1 absent (400,000 billed, no record) -- checked 41.7% of 2,400,000 billed tokens; exact where evidence survives; widest short day 2026-09-03 5.00x
+```
+
+The verdicts are `every_day_exact`, `exact_where_evidence_survives`, `no_exact_day`,
+`corpus_heavier_on_a_witnessed_day` and `no_day_above_floor`. The scope is every billed day
+above the floor, deliberately not the window where both stores reach: a day the corpus never
+reached is exactly the `absent` case, and intersecting first would drop those days. The axis is
+the one place in this command that can say the ratio is arithmetic on a lossy denominator —
+`checked_share` is that share — and it still names no cause for the missing records.
+
 **Five states, five names, no zeros.** `measured` (both sides count), `receipt bills,
 transcripts silent` (the receipt's token table states the day, the transcripts do not reach it),
 `activity without tokens` (messages counted, no table states a token number), `tokens without
@@ -443,7 +467,7 @@ The suite covers receipt reconciliation, unit and cumulative checks, loop dedupl
 
 - `recent` places its window by the newest recorded day, so it measures the last N days *of the store*, not the last N days of wall-clock time; a store that stopped being written three weeks ago reports three weeks ago. Use `--until` to place the window where you meant it, and read the anchor line to see which was used.
 - `recent` cannot tell a quiet day from a day the meter failed to write: both are days with no record, both make the total a floor, and both are printed as `no record`. `--by-day` makes each one visible as a row instead of a date in a comma list, and it makes a run of blank days obvious, but it cannot label them - a store only holds what it wrote, so a holiday and a broken meter leave the same shape. A truly empty window prints no total at all rather than `0`. `quiet` is the one place this is separated, and only where two independent stores both reach: a day the receipt counts messages on is not quiet, whatever the transcripts hold. Outside that intersection nothing is claimed.
-- `quiet` does not say *why* a day carries messages and no tokens. It separates the days the receipt's own token table bills — the number is stated, the transcripts simply do not reach those days — from the days no table states a number for, and refuses to call either quiet. The cause itself (pruned transcripts, a client that writes none, an unmetered day) is still not decidable from the stores, and a transcript total over a window containing billed days is a floor. The `meter check` block does measure the *shape* of the gap on days both meters speak (record sum, deduped, or neither), but it can only rule the repeated-write explanation in or out — when it returns `neither`, the remaining factor is still unattributed, and this command names no cause for it. The per-day axis says whether agreement holds day by day, not why it fails: a day whose transcript total is far smaller than the receipt's own number is printed, but the reason for that one day (pruned transcripts, a rotated log, a partial write) is still outside what the two stores state. The per-model axis has the same limit in another direction: it can say the gap is spread across every model and that no single factor explains it, but it cannot say what moves the number. A model renamed between receipt versions splits into a receipt-only and a transcript-only row, which is listed rather than merged — merging on a similarity guess would invent an identity nobody wrote.
+- `quiet` does not say *why* a day carries messages and no tokens. It separates the days the receipt's own token table bills — the number is stated, the transcripts simply do not reach those days — from the days no table states a number for, and refuses to call either quiet. The cause itself (pruned transcripts, a client that writes none, an unmetered day) is still not decidable from the stores, and a transcript total over a window containing billed days is a floor. The `meter check` block does measure the *shape* of the gap on days both meters speak (record sum, deduped, or neither), but it can only rule the repeated-write explanation in or out — when it returns `neither`, the remaining factor is still unattributed, and this command names no cause for it. The `witness` line narrows that remainder without attributing it: on this machine the receipt's day total equals the sum of that day's surviving usage records exactly on every day the corpus still holds them (verified by a recount outside the tool), while the corpus as a whole holds far fewer written tokens inside the receipt's span than the receipt states — so the factor is arithmetic over a lossy denominator, the missing amount is measured, and why those records are gone (pruning, a rotated log, another machine) is not decidable here. The per-day axis says whether agreement holds day by day, not why it fails: a day whose transcript total is far smaller than the receipt's own number is printed, but the reason for that one day (pruned transcripts, a rotated log, a partial write) is still outside what the two stores state. The per-model axis has the same limit in another direction: it can say the gap is spread across every model and that no single factor explains it, but it cannot say what moves the number. A model renamed between receipt versions splits into a receipt-only and a transcript-only row, which is listed rather than merged — merging on a similarity guess would invent an identity nobody wrote.
 - `recent` measures tokens, never a share of a plan allowance: no quota ceiling is in the store, and none is assumed.
 
 - Receipt field names and shapes are harness-specific and can change.

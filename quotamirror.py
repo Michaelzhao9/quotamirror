@@ -4489,6 +4489,112 @@ def _model_axis(billed_by_model, transcript_by_model, deciding, tol):
     return fragment
 
 
+def _witness_axis(billed_days, record_sum, floor, tol, unmeasured=()):
+    """Does the corpus still hold the records the receipt summed?
+
+    The aggregate ratio in `_quiet_meter_check` divides the receipt's day table
+    by whatever records survive in the transcripts. That division is only a
+    meter disagreement when both sides read the same records. This axis states,
+    per billed day, which of the three cases the corpus is in:
+
+    * `exact` - the receipt's day total equals the sum of the usage records the
+      corpus holds for that day, so the evidence for that day is present and
+      the two stores agree on it;
+    * `remnant` - the corpus holds some records and less than the receipt, so
+      the day's evidence is incomplete and the difference cannot be read as a
+      meter factor;
+    * `absent` - the corpus holds no record for the day at all: the receipt
+      states a number and nothing on this machine can check it.
+
+    A fourth state, `over`, covers the opposite direction - the corpus holds
+    more than the receipt - which is a genuine disagreement and is never folded
+    into the evidence holes. `checked_share` is the share of the receipt's
+    tokens that sits on exact days, so a total ratio can be read against how
+    much of the bill was checkable in the first place.
+    """
+    block = {
+        "available": False,
+        "verdict": "not_measured",
+        "days": {
+            "exact": 0,
+            "remnant": 0,
+            "absent": 0,
+            "over": 0,
+            "unmeasured": 0,
+        },
+        "tokens": {"exact": 0, "remnant": 0, "absent": 0, "over": 0},
+        "receipt_total": 0,
+        "record_sum_total": 0,
+        "residual_tokens": 0,
+        "unwitnessed_tokens": 0,
+        "checked_share": None,
+        "worst_day": None,
+        "worst_day_ratio": None,
+        "reason": None,
+    }
+    # Deliberately not limited to the window where both stores reach: a day the
+    # receipt bills and the corpus never reaches is the absent case, and the
+    # intersection would drop exactly those days.
+    days = [
+        day
+        for day, tokens in (billed_days or {}).items()
+        if tokens and int(tokens) >= floor
+    ]
+    if not days:
+        block["reason"] = (
+            f"no billed day reaches the {floor:,}-token floor, so no day's evidence can be "
+            "weighed"
+        )
+        return block
+    rows = []
+    unknown = set(unmeasured or ())
+    for day in sorted(days):
+        billed = int(billed_days.get(day) or 0)
+        written = int((record_sum or {}).get(day, 0) or 0)
+        block["receipt_total"] += billed
+        if day in unknown:
+            # The scan holds the day but states no record sum for it, so an
+            # unbalanced day here would be a missing measurement rather than
+            # missing evidence.
+            state = "unmeasured"
+        elif written == 0:
+            state = "absent"
+        elif abs(billed / written - 1) <= tol:
+            state = "exact"
+        elif billed > written:
+            state = "remnant"
+        else:
+            state = "over"
+        block["days"][state] += 1
+        if state in block["tokens"]:
+            block["tokens"][state] += billed
+        block["record_sum_total"] += written
+        rows.append({"day": day, "receipt": billed, "record_sum": written, "state": state})
+    block["available"] = True
+    remnant = [row for row in rows if row["state"] == "remnant"]
+    block["residual_tokens"] = sum(row["receipt"] - row["record_sum"] for row in remnant)
+    block["unwitnessed_tokens"] = block["tokens"]["remnant"] + block["tokens"]["absent"]
+    if block["receipt_total"]:
+        block["checked_share"] = round(block["tokens"]["exact"] / block["receipt_total"], 4)
+    if remnant:
+        worst = max(remnant, key=lambda row: row["receipt"])
+        # Billed days arrive keyed by `date` from the receipt's own table; a date
+        # object reached the JSON writer once already, so the label is stringified
+        # here and nowhere else.
+        day = worst["day"]
+        block["worst_day"] = day if isinstance(day, str) else day.isoformat()
+        block["worst_day_ratio"] = round(worst["receipt"] / worst["record_sum"], 4)
+    if block["days"]["over"]:
+        block["verdict"] = "corpus_heavier_on_a_witnessed_day"
+    elif block["days"]["exact"] == len(rows):
+        block["verdict"] = "every_day_exact"
+    elif block["days"]["exact"] and not block["days"]["unmeasured"]:
+        block["verdict"] = "exact_where_evidence_survives"
+    else:
+        block["verdict"] = "no_exact_day"
+    return block
+
+
 def _quiet_meter_check(
     billed_days,
     transcript_days,
@@ -4536,6 +4642,9 @@ def _quiet_meter_check(
         "reason": None,
     }
     block.update(_model_axis({}, {}, [], tol))
+    block["witness"] = _witness_axis(
+        billed_days, transcript_written, floor, tol, written_unknown
+    )
     if not billed_days:
         block["verdict"] = "no_token_meter"
         block["reason"] = (
@@ -5073,6 +5182,40 @@ def render_quiet(payload):
                 "    one side only " + " | ".join(sides)
                 + " -- named by one store, counted by neither"
             )
+        witness = block.get("witness") or {}
+        if witness.get("available"):
+            # The ratios above divide by the records that survive, not by the
+            # records the meter read. Until that difference is stated, a total
+            # ratio reads as a meter factor.
+            day_parts = [f"{witness['days']['exact']} day(s) exact"]
+            if witness["days"]["remnant"]:
+                day_parts.append(
+                    f"{witness['days']['remnant']} short ({_fmt(witness['tokens']['remnant'])} "
+                    f"billed, {_fmt(witness['residual_tokens'])} missing)"
+                )
+            if witness["days"]["absent"]:
+                day_parts.append(
+                    f"{witness['days']['absent']} absent "
+                    f"({_fmt(witness['tokens']['absent'])} billed, no record)"
+                )
+            if witness["days"]["over"]:
+                day_parts.append(
+                    f"{witness['days']['over']} heavier in the corpus "
+                    f"({_fmt(witness['tokens']['over'])} billed)"
+                )
+            if witness["days"]["unmeasured"]:
+                day_parts.append(f"{witness['days']['unmeasured']} with no record sum")
+            line = (
+                f"    witness      {' | '.join(day_parts)} -- checked "
+                f"{witness['checked_share']:.1%} of {_fmt(witness['receipt_total'])} billed "
+                f"tokens; {witness['verdict'].replace('_', ' ')}"
+            )
+            if witness.get("worst_day"):
+                line += (
+                    f"; widest short day {witness['worst_day']} "
+                    f"{witness['worst_day_ratio']:.2f}x"
+                )
+            lines.append(line)
     lines.append(f"  meter check: {block.get('verdict')} -- {block.get('reason')}")
     lines.append(
         f"  outside     {payload['days_outside_window']} day(s) are reached by only one store "
