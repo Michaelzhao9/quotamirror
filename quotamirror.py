@@ -4489,6 +4489,85 @@ def _model_axis(billed_by_model, transcript_by_model, deciding, tol):
     return fragment
 
 
+def _witness_rows(billed_days, record_sum, floor, tol, unmeasured=()):
+    """Classify each billed day that reaches the floor. Returns (rows, receipt_total).
+
+    Split out so the replay axis can read the same day verdicts instead of
+    re-deciding them with a second copy of the tolerance rule.
+    """
+    days = [
+        day
+        for day, tokens in (billed_days or {}).items()
+        if tokens and int(tokens) >= floor
+    ]
+    rows = []
+    receipt_total = 0
+    unknown = set(unmeasured or ())
+    for day in sorted(days):
+        billed = int(billed_days.get(day) or 0)
+        written = int((record_sum or {}).get(day, 0) or 0)
+        receipt_total += billed
+        if day in unknown:
+            # The scan holds the day but states no record sum for it, so an
+            # unbalanced day here would be a missing measurement rather than
+            # missing evidence.
+            state = "unmeasured"
+        elif written == 0:
+            state = "absent"
+        elif abs(billed / written - 1) <= tol:
+            state = "exact"
+        elif billed > written:
+            state = "remnant"
+        else:
+            state = "over"
+        rows.append({"day": day, "receipt": billed, "record_sum": written, "state": state})
+    return rows, receipt_total
+
+
+def _replay_axis(rows, deduped_by_day):
+    """Of the tokens written on a witnessed day, how many are repeat writes?
+
+    The witness axis certifies which billed days have a complete record set.
+    Only on those days may the record sum be compared with the deduped total:
+    the difference is then the same message written more than once (a streamed
+    response lands in the corpus repeatedly), not records that went missing.
+
+    The share is deliberately refused when no day is witnessed - a dedupe over
+    incomplete records measures the loss, not the repeats - and short or absent
+    days are counted as excluded rather than pooled into the denominator.
+    """
+    block = {
+        "available": False,
+        "verdict": "not_measured",
+        "days": 0,
+        "days_excluded": 0,
+        "written_tokens": 0,
+        "deduped_tokens": 0,
+        "replay_tokens": 0,
+        "replay_share": None,
+        "reason": None,
+    }
+    exact = [row for row in rows if row["state"] == "exact"]
+    block["days_excluded"] = len(rows) - len(exact)
+    if not exact:
+        block["verdict"] = "no_exact_day"
+        block["reason"] = (
+            "no billed day carries a complete record set, and a dedupe over incomplete "
+            "records is a floor on the repeat count rather than a share of it"
+        )
+        return block
+    block["days"] = len(exact)
+    for row in exact:
+        block["written_tokens"] += row["record_sum"]
+        block["deduped_tokens"] += int((deduped_by_day or {}).get(row["day"], 0) or 0)
+    block["replay_tokens"] = block["written_tokens"] - block["deduped_tokens"]
+    block["available"] = True
+    if block["written_tokens"]:
+        block["replay_share"] = round(block["replay_tokens"] / block["written_tokens"], 4)
+    block["verdict"] = "repeat_measured" if block["replay_tokens"] else "no_repeat_observed"
+    return block
+
+
 def _witness_axis(billed_days, record_sum, floor, tol, unmeasured=()):
     """Does the corpus still hold the records the receipt summed?
 
@@ -4535,42 +4614,25 @@ def _witness_axis(billed_days, record_sum, floor, tol, unmeasured=()):
     # Deliberately not limited to the window where both stores reach: a day the
     # receipt bills and the corpus never reaches is the absent case, and the
     # intersection would drop exactly those days.
-    days = [
-        day
-        for day, tokens in (billed_days or {}).items()
-        if tokens and int(tokens) >= floor
-    ]
-    if not days:
+    rows, receipt_total = _witness_rows(
+        billed_days, record_sum, floor, tol, unmeasured
+    )
+    if not rows:
         block["reason"] = (
             f"no billed day reaches the {floor:,}-token floor, so no day's evidence can be "
             "weighed"
         )
         return block
-    rows = []
-    unknown = set(unmeasured or ())
-    for day in sorted(days):
-        billed = int(billed_days.get(day) or 0)
-        written = int((record_sum or {}).get(day, 0) or 0)
-        block["receipt_total"] += billed
-        if day in unknown:
-            # The scan holds the day but states no record sum for it, so an
-            # unbalanced day here would be a missing measurement rather than
-            # missing evidence.
-            state = "unmeasured"
-        elif written == 0:
-            state = "absent"
-        elif abs(billed / written - 1) <= tol:
-            state = "exact"
-        elif billed > written:
-            state = "remnant"
-        else:
-            state = "over"
+    block["receipt_total"] = receipt_total
+    for row in rows:
+        state = row["state"]
+        billed = row["receipt"]
         block["days"][state] += 1
         if state in block["tokens"]:
             block["tokens"][state] += billed
-        block["record_sum_total"] += written
-        rows.append({"day": day, "receipt": billed, "record_sum": written, "state": state})
+        block["record_sum_total"] += row["record_sum"]
     block["available"] = True
+
     remnant = [row for row in rows if row["state"] == "remnant"]
     block["residual_tokens"] = sum(row["receipt"] - row["record_sum"] for row in remnant)
     block["unwitnessed_tokens"] = block["tokens"]["remnant"] + block["tokens"]["absent"]
@@ -4645,6 +4707,10 @@ def _quiet_meter_check(
     block["witness"] = _witness_axis(
         billed_days, transcript_written, floor, tol, written_unknown
     )
+    witness_rows, _ = _witness_rows(
+        billed_days, transcript_written, floor, tol, written_unknown
+    )
+    block["replay"] = _replay_axis(witness_rows, transcript_days)
     if not billed_days:
         block["verdict"] = "no_token_meter"
         block["reason"] = (
@@ -5216,6 +5282,20 @@ def render_quiet(payload):
                     f"{witness['worst_day_ratio']:.2f}x"
                 )
             lines.append(line)
+            replay = block.get("replay") or {}
+            if replay.get("available"):
+                # Only witnessed days enter this share: on a day with missing
+                # records a dedupe measures the loss, not the repeats.
+                lines.append(
+                    f"    repeat       {_fmt(replay['replay_tokens'])} of "
+                    f"{_fmt(replay['written_tokens'])} token(s) written on "
+                    f"{replay['days']} day(s) are the same message written again "
+                    f"({replay['replay_share']:.1%}); deduped {_fmt(replay['deduped_tokens'])}, "
+                    f"{replay['days_excluded']} day(s) excluded for incomplete records"
+                )
+            elif replay:
+                lines.append(f"    repeat       repeat share not measured -- {replay['reason']}")
+
     lines.append(f"  meter check: {block.get('verdict')} -- {block.get('reason')}")
     lines.append(
         f"  outside     {payload['days_outside_window']} day(s) are reached by only one store "
