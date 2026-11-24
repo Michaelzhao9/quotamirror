@@ -2375,6 +2375,14 @@ READINGS_SCHEMA = 1
 # history sitting in a cache file for no reason.
 MAX_READINGS = 5
 
+# A digest can say that something moved; only the per-file facts can say what.
+# The manifest is therefore opt-in (`--manifest`) and capped: a receipt block
+# that carries a million file names is not a receipt any more, and a capped
+# manifest must refuse to name anything rather than name a subset and look
+# complete.
+MANIFEST_LIMIT = 2000
+ATTRIBUTION_LIMIT = 10
+
 READING_STORE_DEFAULT = Path.home() / ".cache" / "quotamirror" / "readings.json"
 
 
@@ -3946,7 +3954,7 @@ def _content_hash(path, chunk=1 << 20):
     return digest.hexdigest()[:16]
 
 
-def scan_usage(root, max_files=None):
+def scan_usage(root, max_files=None, manifest=False):
     """Read the Claude transcript corpus once: one merge rule, one set of counts.
 
     `nested` and `compare --claude-transcripts` used to carry a copy of this loop
@@ -3966,6 +3974,7 @@ def scan_usage(root, max_files=None):
     bytes_read = 0
     inventory_parts = []
     content_parts = []
+    file_facts = []
     day_files = {}
     skipped_lines = 0
     records = 0
@@ -3991,6 +4000,8 @@ def scan_usage(root, max_files=None):
             label = str(path)
         inventory_parts.append(f"{label}|{file_stat.st_size}|{file_stat.st_mtime_ns}")
         content_parts.append(f"{label}|{content_hash}")
+        if manifest:
+            file_facts.append((label, file_stat.st_size, file_stat.st_mtime_ns, content_hash))
         with handle:
             for line in handle:
                 if '"usage"' not in line:
@@ -4087,7 +4098,7 @@ def scan_usage(root, max_files=None):
     for record_day in days.values():
         record_day["duplicate_tokens"] = record_day["naive_tokens"] - record_day["total_tokens"]
 
-    return {
+    result = {
         "root": str(root_path),
         "files": files,
         "files_skipped": files_skipped,
@@ -4112,6 +4123,12 @@ def scan_usage(root, max_files=None):
         "dedupe": "message_id_max",
         "day_attribution": "earliest_recorded_day",
     }
+    if manifest:
+        facts = sorted(file_facts)
+        result["file_facts"] = facts[:MANIFEST_LIMIT]
+        result["manifest_total"] = len(facts)
+        result["manifest_truncated"] = len(facts) > MANIFEST_LIMIT
+    return result
 
 
 def _within(value, target, tolerance):
@@ -4702,6 +4719,9 @@ def _reading_axis(inventory, rows):
         "digest_basis": None,
         "content_digest": None,
         "content_basis": None,
+        "manifest": None,
+        "manifest_total": 0,
+        "manifest_truncated": False,
         "per_day": {},
         "reason": None,
     }
@@ -4724,6 +4744,9 @@ def _reading_axis(inventory, rows):
         digest_basis=inventory.get("digest_basis"),
         content_digest=inventory.get("content_digest"),
         content_basis=inventory.get("content_basis"),
+        manifest=inventory.get("file_facts") or None,
+        manifest_total=int(inventory.get("manifest_total") or 0),
+        manifest_truncated=bool(inventory.get("manifest_truncated")),
     )
     day_files = inventory.get("day_files") or {}
     day_records = inventory.get("day_records") or {}
@@ -4791,7 +4814,47 @@ def _prior_reading(doc):
         )
     block["digest_basis"] = doc.get("digest_basis")
     block["content_basis"] = doc.get("content_basis")
+    block["manifest"], block["manifest_total"], block["manifest_truncated"] = _prior_manifest(doc)
     return block
+
+
+def _prior_manifest(doc):
+    """Normalise a supplied file manifest, or refuse one that is not a manifest.
+
+    A manifest is the only part of a reading that is not a fixed-size digest,
+    so it is also the only part that can arrive malformed. Entries are
+    `[name, size, mtime_ns, content_hash]` - the exact tuple the scan built -
+    and a wrong shape is refused here rather than skipped at comparison time,
+    because a silently dropped entry would make a changed file invisible.
+    """
+    raw = doc.get("manifest")
+    total = doc.get("manifest_total")
+    truncated = doc.get("manifest_truncated")
+    try:
+        total = int(total) if total is not None else 0
+    except (TypeError, ValueError):
+        total = 0
+    if raw is None:
+        return None, total, bool(truncated)
+    if not isinstance(raw, list):
+        raise ValueError("--compare-reading holds a manifest that is not a list of files")
+    entries = []
+    for item in raw:
+        if not isinstance(item, (list, tuple)) or len(item) != 4:
+            raise ValueError(
+                "--compare-reading holds a manifest entry that is not "
+                "[name, size, mtime_ns, content_hash]"
+            )
+        name, size, mtime_ns, digest = item
+        if not isinstance(name, str) or not name:
+            raise ValueError("--compare-reading holds a manifest entry without a name")
+        try:
+            entries.append((name, int(size), int(mtime_ns), str(digest)))
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"--compare-reading holds a manifest entry with a non-numeric size or mtime: {name}"
+            ) from None
+    return entries, total or len(entries), bool(truncated)
 
 
 def read_prior_reading(path):
@@ -4807,7 +4870,127 @@ def read_prior_reading(path):
     return _prior_reading(doc)
 
 
+def _manifest_index(entries):
+    return {name: (size, mtime_ns, digest) for name, size, mtime_ns, digest in entries}
+
+
+def _name_changes(current, prior):
+    """Name the files behind a moved digest, or say exactly why naming stopped.
+
+    A verdict says a corpus changed; it never says which file did. Two digests
+    are one-way, so the subject can only come from a manifest both readings
+    carry. Every refusal below is a case where a name could be missing and a
+    partial list would read as a complete one.
+    """
+    attribution = {
+        "available": False,
+        "reason": None,
+        "capped_at": ATTRIBUTION_LIMIT,
+        "mtime_only": [],
+        "mtime_only_total": 0,
+        "content_changed": [],
+        "content_changed_total": 0,
+        "added": [],
+        "added_total": 0,
+        "removed": [],
+        "removed_total": 0,
+    }
+    now_manifest = (current or {}).get("manifest")
+    prior_manifest = (prior or {}).get("manifest") if isinstance(prior, dict) else None
+    if not now_manifest and not prior_manifest:
+        attribution["reason"] = (
+            "neither reading carries a file manifest, so a changed file is counted but "
+            "not named; re-run both with --manifest to name it"
+        )
+        return attribution
+    if not now_manifest:
+        attribution["reason"] = (
+            "this run carries no file manifest, so the supplied one has nothing to be "
+            "matched against; re-run with --manifest to name the files"
+        )
+        return attribution
+    if not prior_manifest:
+        attribution["reason"] = (
+            "the supplied reading carries no file manifest (it was taken without "
+            "--manifest), so a changed file can be counted but not named"
+        )
+        return attribution
+    if (current or {}).get("manifest_truncated") or (prior or {}).get("manifest_truncated"):
+        attribution["reason"] = (
+            f"one of the manifests hit the {MANIFEST_LIMIT}-file cap, so a name can be "
+            "missing; refusing to name part of a corpus"
+        )
+        return attribution
+    for label, side in (("this run", current), ("the supplied reading", prior)):
+        entries = side.get("manifest") or []
+        total = side.get("manifest_total") or len(entries)
+        if total != len(entries):
+            attribution["reason"] = (
+                f"{label} holds {len(entries)} of {total} file(s) in its manifest, so a "
+                "name could be missing"
+            )
+            return attribution
+        files = _as_int(side.get("files"))
+        if files is not None and files != len(entries):
+            attribution["reason"] = (
+                f"{label} names {len(entries)} file(s) but reports {files} file(s) read, "
+                "so a name could be missing"
+            )
+            return attribution
+    now_index = _manifest_index(current["manifest"])
+    prior_index = _manifest_index(prior["manifest"])
+    mtime_only = []
+    content_changed = []
+    for name in sorted(set(now_index) & set(prior_index)):
+        now_size, now_mtime, now_hash = now_index[name]
+        prior_size, prior_mtime, prior_hash = prior_index[name]
+        if now_hash != prior_hash:
+            content_changed.append(name)
+        elif (now_size, now_mtime) != (prior_size, prior_mtime):
+            mtime_only.append(name)
+    added = sorted(set(now_index) - set(prior_index))
+    removed = sorted(set(prior_index) - set(now_index))
+    if current.get("content_equal") and content_changed:
+        # The byte digest says every file is identical; the manifest says one
+        # of them is not. One of the two readings was taken under another rule.
+        attribution["reason"] = (
+            "the content digests agree while the manifest names a changed file "
+            f"({content_changed[0]}), so the two readings were not produced under one rule"
+        )
+        return attribution
+    attribution["available"] = True
+    attribution["mtime_only"] = mtime_only[:ATTRIBUTION_LIMIT]
+    attribution["mtime_only_total"] = len(mtime_only)
+    attribution["content_changed"] = content_changed[:ATTRIBUTION_LIMIT]
+    attribution["content_changed_total"] = len(content_changed)
+    attribution["added"] = added[:ATTRIBUTION_LIMIT]
+    attribution["added_total"] = len(added)
+    attribution["removed"] = removed[:ATTRIBUTION_LIMIT]
+    attribution["removed_total"] = len(removed)
+    return attribution
+
+
 def compare_readings(current, prior):
+    """Compare two readings, then name the files behind the difference.
+
+    The verdict is decided by `_compare_readings`; the naming is added here for
+    the same reason `quiet_days` wraps its own body - every early return carries
+    the naming block, so a refusal path cannot silently drop the sentence that
+    says why no file was named.
+    """
+    block = _compare_readings(current, prior)
+    now_side = {
+        "manifest": (current or {}).get("manifest"),
+        "manifest_total": (current or {}).get("manifest_total"),
+        "manifest_truncated": (current or {}).get("manifest_truncated"),
+        "files": (block.get("current") or {}).get("files"),
+        "content_equal": block.get("content_equal"),
+    }
+    block["attribution"] = _name_changes(now_side, prior)
+    return block
+
+
+def _compare_readings(current, prior):
     """Say which of five differences the gap between two readings is.
 
     One digest cannot answer this on its own, and two digests only can when
@@ -4977,6 +5160,25 @@ def _compare_lines(block, width=80):
     emit("verdict", f"{verdict} -- {_COMPARE_TEXT.get(verdict, '')}")
     if block.get("reason"):
         emit("", block["reason"])
+    attribution = block.get("attribution") or {}
+    if not attribution.get("available"):
+        emit("named", "not measured -- " + (attribution.get("reason") or "no manifest"))
+        return lines
+    moved = []
+    for key, label in (
+        ("mtime_only", "touched"),
+        ("content_changed", "edited"),
+        ("added", "added"),
+        ("removed", "removed"),
+    ):
+        total = attribution.get(f"{key}_total") or 0
+        if not total:
+            continue
+        names = attribution.get(key) or []
+        shown = ", ".join(names)
+        more = f" (+{total - len(names)} more)" if total > len(names) else ""
+        moved.append(f"{label} {total}: {shown}{more}")
+    emit("named", "; ".join(moved) if moved else "no file in the shared manifest moved")
     return lines
 
 
@@ -5361,6 +5563,9 @@ def _quiet_days(cache, scan, min_tokens=None, tolerance=None):
             "digest_basis": scan.get("digest_basis"),
             "content_digest": scan.get("content_digest"),
             "content_basis": scan.get("content_basis"),
+            "manifest_total": scan.get("manifest_total") or 0,
+            "manifest_truncated": bool(scan.get("manifest_truncated")),
+            "file_facts": scan.get("file_facts"),
             "day_files": scan.get("day_files") or {},
             "day_records": day_records,
         }
@@ -6877,6 +7082,14 @@ def main(argv=None):
             "this one with; without it this reading stands alone"
         ),
     )
+    quiet.add_argument(
+        "--manifest",
+        action="store_true",
+        help=(
+            "carry the name, size, mtime and content hash of every file read inside the reading, "
+            f"so a comparison can name the file that moved (capped at {MANIFEST_LIMIT} files)"
+        ),
+    )
     quiet.add_argument("--json", action="store_true", help="machine-readable payload")
 
     nested = sub.add_parser(
@@ -7022,7 +7235,7 @@ def main(argv=None):
         if not root.exists():
             print(f"quotamirror: no transcripts at {root}", file=sys.stderr)
             return 2
-        scan = scan_usage(root, max_files=args.max_files)
+        scan = scan_usage(root, max_files=args.max_files, manifest=args.manifest)
         prior = None
         if args.compare_reading:
             try:

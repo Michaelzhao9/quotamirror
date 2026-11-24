@@ -246,6 +246,7 @@ python3 quotamirror.py quiet --json
 python3 quotamirror.py quiet --transcripts ~/.claude/projects --max-files 200
 python3 quotamirror.py quiet --json > reading-a.json
 python3 quotamirror.py quiet --compare-reading reading-a.json   # what changed since?
+python3 quotamirror.py quiet --manifest --json > reading-a.json  # ...and name the file
 ```
 
 `recent --by-day` can say a day carries no token record. It cannot say *why*, and inside a
@@ -438,6 +439,27 @@ digest with a different file or record count, so such a pair is one of them edit
 another rule. Without the flag the line reads `compare not measured -- --compare-reading was not
 given`; a comparison that did not happen is never printed as agreement.
 
+**A verdict says the corpus moved; a manifest says which file.** The two digests are one-way, so
+naming a file needs the per-file facts both readings must carry. `--manifest` puts them in the
+reading - name (relative to the transcript root), size, mtime_ns and a sha256[:16] of the bytes,
+for every file read - and the comparison then prints a `named` line beside the verdict:
+
+```
+                 verdict  metadata_only -- no byte moved; only (name, size, mtime) did --
+                          a touch, not an edit
+                 named    touched 1: <project>/<session>.jsonl
+```
+
+Four lists come out of the pair: `touched` (same bytes, different size-or-mtime), `edited` (same
+name, different bytes), `added` and `removed`. That is the row the verdict alone cannot produce -
+a rename and an in-place edit of the same length both read as `bytes_differ`, and only the name
+lists tell them apart. Naming refuses in five cases rather than name part of a corpus: neither
+reading has a manifest, this run has none, the supplied one has none, either manifest hit the
+2,000-file cap, or a manifest disagrees with its own file count. Each prints its own
+sentence. The cost is stated rather than hidden: on a 940-file corpus (2.35 GiB) the payload grows
+from 29.7 KB to 235.9 KB, about 219 bytes per file, and the digests are unchanged by the flag - a
+manifest adds names, not identity.
+
 **Five states, five names, no zeros.** `measured` (both sides count), `receipt bills,
 transcripts silent` (the receipt's token table states the day, the transcripts do not reach it),
 `activity without tokens` (messages counted, no table states a token number), `tokens without
@@ -562,7 +584,7 @@ The suite covers receipt reconciliation, unit and cumulative checks, loop dedupl
 - `recent` places its window by the newest recorded day, so it measures the last N days *of the store*, not the last N days of wall-clock time; a store that stopped being written three weeks ago reports three weeks ago. Use `--until` to place the window where you meant it, and read the anchor line to see which was used.
 - `recent` cannot tell a quiet day from a day the meter failed to write: both are days with no record, both make the total a floor, and both are printed as `no record`. `--by-day` makes each one visible as a row instead of a date in a comma list, and it makes a run of blank days obvious, but it cannot label them - a store only holds what it wrote, so a holiday and a broken meter leave the same shape. A truly empty window prints no total at all rather than `0`. `quiet` is the one place this is separated, and only where two independent stores both reach: a day the receipt counts messages on is not quiet, whatever the transcripts hold. Outside that intersection nothing is claimed.
 - `quiet` does not say *why* a day carries messages and no tokens. It separates the days the receipt's own token table bills — the number is stated, the transcripts simply do not reach those days — from the days no table states a number for, and refuses to call either quiet. The cause itself (pruned transcripts, a client that writes none, an unmetered day) is still not decidable from the stores, and a transcript total over a window containing billed days is a floor. The `meter check` block does measure the *shape* of the gap on days both meters speak (record sum, deduped, or neither), but it can only rule the repeated-write explanation in or out — when it returns `neither`, the remaining factor is still unattributed, and this command names no cause for it. The `witness` line narrows that remainder without attributing it: on this machine the receipt's day total equals the sum of that day's surviving usage records exactly on every day the corpus still holds them (verified by a recount outside the tool), while the corpus as a whole holds far fewer written tokens inside the receipt's span than the receipt states — so the factor is arithmetic over a lossy denominator, the missing amount is measured, and why those records are gone (pruning, a rotated log, another machine) is not decidable here. The per-day axis says whether agreement holds day by day, not why it fails: a day whose transcript total is far smaller than the receipt's own number is printed, but the reason for that one day (pruned transcripts, a rotated log, a partial write) is still outside what the two stores state. The per-model axis has the same limit in another direction: it can say the gap is spread across every model and that no single factor explains it, but it cannot say what moves the number. A model renamed between receipt versions splits into a receipt-only and a transcript-only row, which is listed rather than merged — merging on a similarity guess would invent an identity nobody wrote. A witness verdict is also a statement about one *reading*: the corpus is mutable, and a day that measures `exact` can measure `short` on a later run of the same binary over the same window. The `reading` line and its `per_day` map are what make those two runs comparable — equal `content` digests mean the same bytes were read, so a moved split is a parsing change rather than a corpus change; the (name, size, mtime) `digest` beside it is cheaper but cannot carry that claim, since an edit that keeps both size and mtime leaves it equal and a touch moves it. What the line cannot do: both digests are local (names are facts about this machine), they change while the corpus is still being written, and `per_day` says *which* files hold a day, not why a record that used to be there is gone. The cause of such a drop (files removed, a rotated log, a read that reached less) is still not decidable from the output.
-- `quiet --compare-reading` compares two readings and says nothing about a third. It stores no reading — the command stays read-only — so a comparison needs the caller to keep the JSON; `metadata_only` says no byte moved, not which file's mtime moved, because the payload carries counts rather than a per-file list; and the digests are over names relative to the transcript root, so a corpus copied from another machine with the same relative layout compares equal to the same corpus read twice. Identity of location is never tested, and a change between two readings is not attributed when a reading in between was never compared.
+- `quiet --compare-reading` compares two readings and says nothing about a third. It stores no reading — the command stays read-only — so a comparison needs the caller to keep the JSON, and three readings kept by the caller still have no verdict: only the pair handed in is compared, and a change between two readings is not attributed when a reading in between was never compared. `--manifest` names the files behind a change, but only when *both* readings carry one and neither hit the 2,000-file cap; a comparison without manifests reports counts and refuses to name, and the cap makes a name possibly missing, so a capped manifest refuses rather than name a subset. A manifest is also a second copy of facts the digests already cover, which is why it is opt-in and roughly 219 bytes per file in the payload. The names are relative to the transcript root, so the digests still compare equal for a corpus copied from another machine with the same relative layout — identity of location is never tested — and a manifest moved to a machine with different mtimes names every file as `touched` until the two readings come from one place.
 
 - `recent` measures tokens, never a share of a plan allowance: no quota ceiling is in the store, and none is assumed.
 - `quiet`'s `repeat/short` rate is measured over the records a short day still holds, and those records may not be a representative sample of what the day wrote: if the missing records were themselves the repeats, this rate understates the day's repeat share, and if they were unique it overstates it. The command prints the amount it divides by and the bill it is not a share of, and it does not correct for the unknown mix — a correction would be a guess wearing a number.
