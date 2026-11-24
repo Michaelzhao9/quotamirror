@@ -3927,6 +3927,25 @@ def _record_day(record):
     return day
 
 
+def _content_hash(path, chunk=1 << 20):
+    """sha256[:16] of one transcript's bytes, read in bounded chunks.
+
+    The inventory digest is over (name, size, mtime) because that is what a
+    directory walk already knows. Size and mtime cannot see an edit that keeps
+    both - a rewrite that changes digits, or a tool that restores the mtime -
+    and they move when a file is merely touched. A digest over the bytes has
+    neither problem, at the cost of reading each file once more.
+    """
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(chunk)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()[:16]
+
+
 def scan_usage(root, max_files=None):
     """Read the Claude transcript corpus once: one merge rule, one set of counts.
 
@@ -3946,6 +3965,7 @@ def scan_usage(root, max_files=None):
     files_read = 0
     bytes_read = 0
     inventory_parts = []
+    content_parts = []
     day_files = {}
     skipped_lines = 0
     records = 0
@@ -3958,6 +3978,7 @@ def scan_usage(root, max_files=None):
     for path in files:
         try:
             file_stat = path.stat()
+            content_hash = _content_hash(path)
             handle = open(path, "r", encoding="utf-8", errors="replace")
         except OSError:
             files_skipped += 1
@@ -3969,6 +3990,7 @@ def scan_usage(root, max_files=None):
         except ValueError:
             label = str(path)
         inventory_parts.append(f"{label}|{file_stat.st_size}|{file_stat.st_mtime_ns}")
+        content_parts.append(f"{label}|{content_hash}")
         with handle:
             for line in handle:
                 if '"usage"' not in line:
@@ -4072,6 +4094,9 @@ def scan_usage(root, max_files=None):
         "files_read": files_read,
         "bytes_read": bytes_read,
         "reading_digest": hashlib.sha256("\n".join(sorted(inventory_parts)).encode("utf-8")).hexdigest()[:12],
+        "digest_basis": "path+size+mtime_ns",
+        "content_digest": hashlib.sha256("\n".join(sorted(content_parts)).encode("utf-8")).hexdigest()[:12],
+        "content_basis": "file bytes",
         "day_files": {day: len(paths) for day, paths in day_files.items()},
         "skipped_lines": skipped_lines,
         "records": records,
@@ -4642,11 +4667,16 @@ def _reading_axis(inventory, rows):
     payload said which files or how many records the reading covered.
 
     So this block states the reading itself. `digest` is a sha256[:12] over
-    (name relative to the root, size, mtime_ns) for every file read: comparing
-    two payloads, an equal digest means the same bytes were read (so a changed
-    total is a parsing change, not a corpus change), and an unequal digest
-    means the corpus itself differed. It identifies a reading, not a corpus
-    across machines - file names and mtimes are local facts.
+    (name relative to the root, size, mtime_ns) for every file read, and
+    `content_digest` is a sha256[:12] over (name, sha256 of the file's bytes).
+    The two answer different questions and both travel, because neither alone
+    can support the sentence "the same corpus was read": an equal `digest` does
+    NOT mean the same bytes (an edit that keeps size and mtime, or a rewrite
+    with the mtime restored, leaves it equal), and an unequal `digest` does not
+    mean different bytes (a touch moves it on its own). `content_digest` is the
+    axis that can carry that claim; `digest` is kept because it is cheap and
+    because a moved one is still a reason to look. Both identify a reading, not
+    a corpus across machines - file names are local facts.
 
     `per_day` ties each witness day to the files and records standing behind
     it, so a day whose split moved can be read as "3 files held it last time,
@@ -4669,6 +4699,9 @@ def _reading_axis(inventory, rows):
         "messages_parsed": 0,
         "bytes": 0,
         "digest": None,
+        "digest_basis": None,
+        "content_digest": None,
+        "content_basis": None,
         "per_day": {},
         "reason": None,
     }
@@ -4688,6 +4721,9 @@ def _reading_axis(inventory, rows):
         messages_parsed=int(inventory.get("messages") or 0),
         bytes=int(inventory.get("bytes_read") or 0),
         digest=inventory.get("reading_digest"),
+        digest_basis=inventory.get("digest_basis"),
+        content_digest=inventory.get("content_digest"),
+        content_basis=inventory.get("content_basis"),
     )
     day_files = inventory.get("day_files") or {}
     day_records = inventory.get("day_records") or {}
@@ -5064,6 +5100,9 @@ def quiet_days(cache, scan, min_tokens=None, tolerance=None):
             "messages": scan.get("messages"),
             "bytes_read": scan.get("bytes_read"),
             "reading_digest": scan.get("reading_digest"),
+            "digest_basis": scan.get("digest_basis"),
+            "content_digest": scan.get("content_digest"),
+            "content_basis": scan.get("content_basis"),
             "day_files": scan.get("day_files") or {},
             "day_records": day_records,
         }
@@ -5321,7 +5360,15 @@ def render_quiet(payload):
             read_of += f", {reading['files_skipped']} unreadable"
         lines.append(
             f"    reading      {read_of}, {reading['records_parsed']:,} usage record(s), "
-            f"{size_text}, digest {reading['digest']} -- the corpus this verdict read"
+            f"{size_text} -- the corpus this verdict read"
+        )
+        # Two digests, because one of them cannot carry the claim alone: an
+        # equal (name, size, mtime) digest is not a statement about the bytes.
+        lines.append(
+            f"                 digest {reading['digest']} ({reading['digest_basis']})"
+        )
+        lines.append(
+            f"                 content {reading['content_digest']} ({reading['content_basis']})"
         )
     elif reading:
         lines.append(f"    reading      reading not identified -- {reading['reason']}")
