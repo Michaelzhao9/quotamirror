@@ -233,3 +233,45 @@ def test_the_absent_comparison_is_printed_on_the_quiet_screen(tmp_path):
     text = quotamirror.render_quiet(payload)
     assert "not measured" in text
     assert "--compare-reading" in text
+
+
+def test_the_cli_refuses_a_file_that_is_not_a_reading(tmp_path, capsys):
+    root = corpus(tmp_path, [usage_line("m1", "2026-05-04T10:00:00Z", 600)])
+    cache_path = tmp_path / "cache.json"
+    cache_path.write_text(json.dumps(cache_with([("2026-05-04", 600)])), encoding="utf-8")
+    base = ["quiet", "--path", str(cache_path), "--transcripts", str(root)]
+
+    broken = tmp_path / "broken.json"
+    broken.write_text("{not json", encoding="utf-8")
+    assert quotamirror.main(base + ["--compare-reading", str(broken)]) == 2
+    assert "not JSON" in capsys.readouterr().err
+
+    other = tmp_path / "other.json"
+    other.write_text(json.dumps({"hello": "world"}), encoding="utf-8")
+    assert quotamirror.main(base + ["--compare-reading", str(other)]) == 2
+    assert "no reading" in capsys.readouterr().err
+
+    assert quotamirror.main(base + ["--compare-reading", str(tmp_path / "absent.json")]) == 2
+    assert "cannot read" in capsys.readouterr().err
+
+
+def test_the_cli_compares_against_a_saved_payload(tmp_path, capsys, monkeypatch):
+    import os
+
+    root = corpus(tmp_path, [usage_line("m1", "2026-05-04T10:00:00Z", 600)])
+    cache_path = tmp_path / "cache.json"
+    cache_path.write_text(json.dumps(cache_with([("2026-05-04", 600)])), encoding="utf-8")
+    saved = tmp_path / "saved.json"
+    base = ["quiet", "--path", str(cache_path), "--transcripts", str(root)]
+
+    assert quotamirror.main(base + ["--json"]) == 0
+    saved.write_text(capsys.readouterr().out, encoding="utf-8")
+
+    assert quotamirror.main(base + ["--compare-reading", str(saved)]) == 0
+    assert "same_reading" in capsys.readouterr().out
+
+    target = root / "a.jsonl"
+    stat = target.stat()
+    os.utime(target, ns=(stat.st_atime_ns, stat.st_mtime_ns + 7_200_000_000_000))
+    assert quotamirror.main(base + ["--compare-reading", str(saved)]) == 0
+    assert "metadata_only" in capsys.readouterr().out
