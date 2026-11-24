@@ -4737,6 +4737,249 @@ def _reading_axis(inventory, rows):
     return block
 
 
+_PRIOR_KEYS = {
+    # A reading reaches this tool in one of two shapes: the `_reading_axis`
+    # block (files_read / bytes / records_parsed / digest) or the scan-shaped
+    # dict quiet_days builds (files_read / bytes_read / records /
+    # reading_digest). Both are accepted, and the pair of names is the only
+    # place the two vocabularies meet.
+    "files": ("files_read", "files"),
+    "bytes": ("bytes", "bytes_read"),
+    "records": ("records_parsed", "records"),
+    "digest": ("digest", "reading_digest"),
+    "content_digest": ("content_digest",),
+}
+
+
+def _prior_reading(doc):
+    """Normalise a supplied reading, or refuse a document that is not one."""
+    if not isinstance(doc, dict):
+        raise ValueError(
+            f"--compare-reading holds a JSON {type(doc).__name__}, not an object"
+        )
+    inner = doc.get("arbitration")
+    if isinstance(inner, dict) and isinstance(inner.get("reading"), dict):
+        doc = inner["reading"]
+    block = {
+        "files": None,
+        "bytes": None,
+        "records": None,
+        "digest": None,
+        "content_digest": None,
+        "digest_basis": None,
+        "content_basis": None,
+    }
+    found = False
+    for name, keys in _PRIOR_KEYS.items():
+        for key in keys:
+            if key not in doc:
+                continue
+            found = True
+            raw = doc[key]
+            if name in {"files", "bytes", "records"}:
+                try:
+                    block[name] = int(raw)
+                except (TypeError, ValueError):
+                    block[name] = None
+            else:
+                block[name] = raw if isinstance(raw, str) and raw else None
+            break
+    if not found:
+        raise ValueError(
+            "--compare-reading holds JSON but no reading: expected a `quiet --json` "
+            "payload or a reading block with a `content_digest`"
+        )
+    block["digest_basis"] = doc.get("digest_basis")
+    block["content_basis"] = doc.get("content_basis")
+    return block
+
+
+def read_prior_reading(path):
+    """Read a saved reading from disk, refusing anything that is not one."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ValueError(f"cannot read --compare-reading {path}: {exc.strerror or exc}")
+    try:
+        doc = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"--compare-reading is not JSON: {exc}")
+    return _prior_reading(doc)
+
+
+def compare_readings(current, prior):
+    """Say which of five differences the gap between two readings is.
+
+    One digest cannot answer this on its own, and two digests only can when
+    both readings are in hand - which is why `quiet` takes a prior reading from
+    the caller instead of writing one (it stays read-only). The classes are
+    decided by the pair, never by one side:
+
+    * `same_reading` - both digests equal: same names, same bytes, same mtime.
+    * `metadata_only` - the content digest is equal and the path digest is not:
+      no byte in the corpus moved, so the corpus was not edited; what moved is
+      (name, size, mtime). This is the verdict the r312 debt named.
+    * `bytes_differ` - same file count and same total bytes, different content
+      digest: an edit that kept the size, a rename, or a swap between files.
+    * `size_differs` - same file count, different total bytes.
+    * `file_set_differs` - a different number of files.
+
+    Refusals are verdicts, not silence: no supplied reading (`no_prior`), a run
+    with no reading of its own (`no_current_reading`), a supplied block from a
+    version with no byte axis or two blocks that contradict each other
+    (`not_comparable`). A contradiction is checked rather than classified: two
+    readings produced under the same rule cannot hold the same content digest
+    and a different file or record count, so such a pair is one of them being
+    edited or taken under another rule.
+    """
+    now = {
+        "files": _as_int((current or {}).get("files_read")),
+        "bytes": _as_int((current or {}).get("bytes")),
+        "records": _as_int((current or {}).get("records_parsed")),
+        "digest": (current or {}).get("digest"),
+        "content_digest": (current or {}).get("content_digest"),
+    }
+    block = {
+        "available": False,
+        "verdict": None,
+        "reason": None,
+        "content_equal": None,
+        "path_equal": None,
+        "files_delta": None,
+        "bytes_delta": None,
+        "records_delta": None,
+        "current": now,
+        "prior": None,
+    }
+    if prior is None:
+        block["verdict"] = "no_prior"
+        block["reason"] = (
+            "--compare-reading was not given, so this reading is compared with no "
+            "other and whether the bytes moved is not measured"
+        )
+        return block
+    block["prior"] = dict(prior)
+    if not (current or {}).get("available"):
+        block["verdict"] = "no_current_reading"
+        block["reason"] = (
+            "this run holds no reading, so the supplied one has nothing to be compared with"
+        )
+        return block
+    if not prior.get("content_digest"):
+        block["verdict"] = "not_comparable"
+        block["reason"] = (
+            "the supplied reading carries no content_digest, so it has no byte axis: it "
+            "was taken before 0.48.0 or was not a reading at all"
+        )
+        return block
+    for name, field in (("files", "files_delta"), ("bytes", "bytes_delta"), ("records", "records_delta")):
+        if now[name] is not None and prior.get(name) is not None:
+            block[field] = now[name] - prior[name]
+    content_equal = prior["content_digest"] == now["content_digest"]
+    path_equal = None
+    if prior.get("digest"):
+        path_equal = prior["digest"] == now["digest"]
+    block["content_equal"] = content_equal
+    block["path_equal"] = path_equal
+    if content_equal:
+        contradictions = []
+        if block["files_delta"] not in (None, 0):
+            contradictions.append(f"{prior['files']} vs {now['files']} file(s)")
+        if block["records_delta"] not in (None, 0):
+            contradictions.append(f"{prior['records']} vs {now['records']} record(s)")
+        if contradictions:
+            block["verdict"] = "not_comparable"
+            block["reason"] = (
+                "the two blocks state the same content digest but a different count ("
+                + ", ".join(contradictions)
+                + "), so one of them was not produced under this rule"
+            )
+            block["available"] = False
+            return block
+        block["available"] = True
+        if path_equal is False:
+            block["verdict"] = "metadata_only"
+        else:
+            block["verdict"] = "same_reading"
+            if path_equal is None:
+                block["reason"] = (
+                    "the supplied reading carries no path digest, so only the byte axis "
+                    "was compared"
+                )
+        return block
+    block["available"] = True
+    if block["files_delta"] not in (None, 0):
+        block["verdict"] = "file_set_differs"
+    elif block["bytes_delta"] not in (None, 0):
+        block["verdict"] = "size_differs"
+    else:
+        block["verdict"] = "bytes_differ"
+    return block
+
+
+def _as_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+_COMPARE_TEXT = {
+    "same_reading": "same names, same bytes, same mtime -- nothing moved",
+    "metadata_only": "no byte moved; only (name, size, mtime) did -- a touch, not an edit",
+    "bytes_differ": "same file count and same byte total, different bytes",
+    "size_differs": "same file count, a different byte total",
+    "file_set_differs": "a different number of files",
+}
+
+
+def _compare_lines(block, width=80):
+    """Render the comparison, or a sentence saying it did not happen."""
+    if not block:
+        return []
+    lines = []
+
+    def emit(label, text):
+        head = " " * 17 + f"{label:<8}"
+        if len(head + text) <= width:
+            lines.append(head + text)
+            return
+        current = head
+        for word in text.split():
+            if current.strip() and len(current) + 1 + len(word) > width:
+                lines.append(current.rstrip())
+                current = " " * 26 + word
+            else:
+                current += (" " if current.strip() else "") + word
+        lines.append(current.rstrip())
+
+    if not block.get("available"):
+        emit("compare", "not measured -- " + block["reason"])
+        return lines
+    prior = block["prior"]
+    size = prior.get("bytes")
+    size_text = ""
+    if isinstance(size, int):
+        if size >= 1024 ** 3:
+            size_text = f", {size / (1024 ** 3):.2f} GiB"
+        else:
+            size_text = f", {size / (1024 ** 2):.1f} MiB"
+    emit(
+        "prior",
+        f"{prior.get('files')} file(s), {prior.get('records')} record(s)" + size_text,
+    )
+    change = []
+    for label, key in (("files", "files_delta"), ("bytes", "bytes_delta"), ("records", "records_delta")):
+        value = block.get(key)
+        change.append(f"{label} {'n/a' if value is None else f'{value:+d}'}")
+    emit("change", ", ".join(change) + " (this run minus the supplied one)")
+    verdict = block["verdict"]
+    emit("verdict", f"{verdict} -- {_COMPARE_TEXT.get(verdict, '')}")
+    if block.get("reason"):
+        emit("", block["reason"])
+    return lines
+
+
 def _witness_axis(billed_days, record_sum, floor, tol, unmeasured=()):
     """Does the corpus still hold the records the receipt summed?
 
@@ -5019,7 +5262,22 @@ def _quiet_meter_check(
     return block
 
 
-def quiet_days(cache, scan, min_tokens=None, tolerance=None):
+def quiet_days(cache, scan, min_tokens=None, tolerance=None, prior=None):
+    """Name the days each of two stores is silent on, and compare readings.
+
+    `_quiet_days` decides the days; this wrapper adds the comparison of the
+    reading it made against one the caller supplies (`--compare-reading`). The
+    comparison is computed here rather than at each of the five exit paths, so
+    a path that stops early still states what it compared - the same rule the
+    reading block itself follows.
+    """
+    payload = _quiet_days(cache, scan, min_tokens=min_tokens, tolerance=tolerance)
+    reading = (payload.get("arbitration") or {}).get("reading") or {}
+    payload["reading_compare"] = compare_readings(reading, prior)
+    return payload
+
+
+def _quiet_days(cache, scan, min_tokens=None, tolerance=None):
     """Name the days each of two independent stores is silent on.
 
     `recent --by-day` can already say a day carries no token record. It cannot
@@ -5370,6 +5628,7 @@ def render_quiet(payload):
         lines.append(
             f"                 content {reading['content_digest']} ({reading['content_basis']})"
         )
+        lines.extend(_compare_lines(payload.get("reading_compare")))
     elif reading:
         lines.append(f"    reading      reading not identified -- {reading['reason']}")
     if not payload["available"] or payload["verdict"] in {
@@ -6609,6 +6868,15 @@ def main(argv=None):
         "--max-files", type=int, default=None, help="only the newest N transcripts"
     )
     _add_floor_args(quiet)
+    quiet.add_argument(
+        "--compare-reading",
+        metavar="PATH",
+        default=None,
+        help=(
+            "a reading saved earlier (a `quiet --json` payload or its reading block) to compare "
+            "this one with; without it this reading stands alone"
+        ),
+    )
     quiet.add_argument("--json", action="store_true", help="machine-readable payload")
 
     nested = sub.add_parser(
@@ -6755,8 +7023,15 @@ def main(argv=None):
             print(f"quotamirror: no transcripts at {root}", file=sys.stderr)
             return 2
         scan = scan_usage(root, max_files=args.max_files)
+        prior = None
+        if args.compare_reading:
+            try:
+                prior = read_prior_reading(args.compare_reading)
+            except ValueError as exc:
+                print(f"quotamirror: {exc}", file=sys.stderr)
+                return 2
         payload = quiet_days(
-            cache, scan, min_tokens=args.min_tokens, tolerance=args.tolerance
+            cache, scan, min_tokens=args.min_tokens, tolerance=args.tolerance, prior=prior
         )
         payload["source"] = str(Path(args.path).resolve())
         payload["transcript_root"] = str(root.resolve())
