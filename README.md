@@ -366,6 +366,27 @@ there; it does not explain the aggregate factor, because most of the bill sits o
 days that never enter this measurement. A repeat whose first write landed on a day with missing
 records is outside these numbers in the same way.
 
+**A witness verdict is a statement about a reading, so the reading is printed.** Two runs of the
+same code over the same window can print a different witness split with nothing in the payload to
+say whether the corpus changed or the tool read a different corpus: a rotated log and a file cut
+by `--max-files` leave the same shape. The `reading` line therefore states what this run opened
+and parsed, with a digest over (relative name, size, mtime) of every file read:
+
+```
+    reading      12 file(s) read, 4,210 usage record(s), 2.26 MiB, digest 5c1d0a9b7e3f -- the corpus this verdict read
+```
+
+Compare two payloads: an equal digest means the same bytes were read, so a moved total is a
+parsing change; an unequal digest means the corpus itself differed. The `per_day` map in `--json`
+then says how many files and records stood behind each witnessed day, which is what turns "that
+day's record sum fell" into "three files held it last run, one holds it now". Two record counts are
+kept apart by name: `records_parsed` is every usage record read, while a day's `records` is what
+the day table attributes to it (a message streamed across midnight is billed on its first day, but
+the file holding the second write still appears under the second day's `files`). Three limits are
+stated rather than blurred: the digest names a reading on this machine only (names and mtimes are
+local facts), a corpus that is being written while the scan runs changes it by design, and with no
+scan in hand the block is `no_reading` and says so instead of printing zeros.
+
 **Five states, five names, no zeros.** `measured` (both sides count), `receipt bills,
 transcripts silent` (the receipt's token table states the day, the transcripts do not reach it),
 `activity without tokens` (messages counted, no table states a token number), `tokens without

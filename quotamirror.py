@@ -3943,6 +3943,10 @@ def scan_usage(root, max_files=None):
     root_path = Path(root)
     files = _transcript_files(root_path, max_files=max_files) if root_path.exists() else []
     files_skipped = 0
+    files_read = 0
+    bytes_read = 0
+    inventory_parts = []
+    day_files = {}
     skipped_lines = 0
     records = 0
     naive_tokens = 0
@@ -3953,10 +3957,18 @@ def scan_usage(root, max_files=None):
 
     for path in files:
         try:
+            file_stat = path.stat()
             handle = open(path, "r", encoding="utf-8", errors="replace")
         except OSError:
             files_skipped += 1
             continue
+        files_read += 1
+        bytes_read += file_stat.st_size
+        try:
+            label = str(path.relative_to(root_path))
+        except ValueError:
+            label = str(path)
+        inventory_parts.append(f"{label}|{file_stat.st_size}|{file_stat.st_mtime_ns}")
         with handle:
             for line in handle:
                 if '"usage"' not in line:
@@ -3981,6 +3993,7 @@ def scan_usage(root, max_files=None):
                 day = _record_day(record)
                 if day:
                     timed += 1
+                    day_files.setdefault(day, set()).add(str(path))
                 else:
                     untimed += 1
                 key = f"id:{message_id}" if message_id else f"uuid:{record.get('uuid') or len(order)}"
@@ -4056,6 +4069,10 @@ def scan_usage(root, max_files=None):
         "root": str(root_path),
         "files": files,
         "files_skipped": files_skipped,
+        "files_read": files_read,
+        "bytes_read": bytes_read,
+        "reading_digest": hashlib.sha256("\n".join(sorted(inventory_parts)).encode("utf-8")).hexdigest()[:12],
+        "day_files": {day: len(paths) for day, paths in day_files.items()},
         "skipped_lines": skipped_lines,
         "records": records,
         "messages": len(order),
@@ -4568,6 +4585,77 @@ def _replay_axis(rows, deduped_by_day):
     return block
 
 
+def _reading_axis(inventory, rows):
+    """Which corpus did the verdict just read?
+
+    A witness verdict is a statement about a *reading*: the files this run
+    opened, the records it parsed, the bytes on disk at that moment. Without
+    that inventory, two runs that print different day splits cannot be told
+    apart - "the corpus changed" and "the tool read a different corpus" look
+    identical. An earlier build caught exactly that: one billed day's record sum
+    fell by most of its value between two runs of the same code, and neither
+    payload said which files or how many records the reading covered.
+
+    So this block states the reading itself. `digest` is a sha256[:12] over
+    (name relative to the root, size, mtime_ns) for every file read: comparing
+    two payloads, an equal digest means the same bytes were read (so a changed
+    total is a parsing change, not a corpus change), and an unequal digest
+    means the corpus itself differed. It identifies a reading, not a corpus
+    across machines - file names and mtimes are local facts.
+
+    `per_day` ties each witness day to the files and records standing behind
+    it, so a day whose split moved can be read as "3 files held it last time,
+    1 file now" instead of a bare number. Two record counts are kept apart on
+    purpose: `records_parsed` is every usage record read, while
+    `per_day[...]['records']` is the records the day table attributes to that
+    day (a message whose records land on two days is counted on the earlier
+    one), so it sums with the untimed records to `records_parsed` rather than
+    being a second count. `per_day[...]['files']` counts the files holding a
+    raw record stamped that day, so a message streamed across midnight puts a
+    file under a day whose attributed record count can be zero.
+    """
+    block = {
+        "available": False,
+        "verdict": "not_measured",
+        "files_read": 0,
+        "files_skipped": 0,
+        "skipped_lines": 0,
+        "records_parsed": 0,
+        "messages_parsed": 0,
+        "bytes": 0,
+        "digest": None,
+        "per_day": {},
+        "reason": None,
+    }
+    if not inventory:
+        block["verdict"] = "no_reading"
+        block["reason"] = (
+            "no transcript scan is in hand, so this verdict names no corpus it read"
+        )
+        return block
+    block.update(
+        available=True,
+        verdict="reading_identified",
+        files_read=int(inventory.get("files_read") or 0),
+        files_skipped=int(inventory.get("files_skipped") or 0),
+        skipped_lines=int(inventory.get("skipped_lines") or 0),
+        records_parsed=int(inventory.get("records") or 0),
+        messages_parsed=int(inventory.get("messages") or 0),
+        bytes=int(inventory.get("bytes_read") or 0),
+        digest=inventory.get("reading_digest"),
+    )
+    day_files = inventory.get("day_files") or {}
+    day_records = inventory.get("day_records") or {}
+    for row in rows:
+        day = row["day"]
+        key = day if isinstance(day, str) else day.isoformat()
+        block["per_day"][key] = {
+            "files": int(day_files.get(day, day_files.get(key, 0)) or 0),
+            "records": int(day_records.get(day, day_records.get(key, 0)) or 0),
+        }
+    return block
+
+
 def _witness_axis(billed_days, record_sum, floor, tol, unmeasured=()):
     """Does the corpus still hold the records the receipt summed?
 
@@ -4667,6 +4755,7 @@ def _quiet_meter_check(
     written_unknown=(),
     billed_by_model=None,
     transcript_by_model=None,
+    reading=None,
 ):
     """Do the two token meters count the same thing, or only the same days?
 
@@ -4711,6 +4800,7 @@ def _quiet_meter_check(
         billed_days, transcript_written, floor, tol, written_unknown
     )
     block["replay"] = _replay_axis(witness_rows, transcript_days)
+    block["reading"] = _reading_axis(reading, witness_rows)
     if not billed_days:
         block["verdict"] = "no_token_meter"
         block["reason"] = (
@@ -4887,10 +4977,13 @@ def quiet_days(cache, scan, min_tokens=None, tolerance=None):
     transcript_written = {}
     transcript_by_model = {}
     written_unknown = set()
+    day_records = {}
     for key, entry in ((scan or {}).get("days") or {}).items():
         day = _day_of(key)
         if day is None or not isinstance(entry, dict):
             continue
+        if "records" in entry:
+            day_records[day] = int(entry.get("records") or 0)
         tokens = int(entry.get("total_tokens") or 0)
         split = {}
         for name, model_entry in (entry.get("by_model") or {}).items():
@@ -4912,6 +5005,23 @@ def quiet_days(cache, scan, min_tokens=None, tolerance=None):
             written_unknown.add(day)
         if tokens:
             transcript_days[day] = tokens
+
+    # The witness/replay verdicts are statements about this reading, so the
+    # reading travels with them: what was opened, what was parsed, and a digest
+    # that lets a later run say whether it read the same bytes.
+    reading = None
+    if scan:
+        reading = {
+            "files_read": scan.get("files_read"),
+            "files_skipped": scan.get("files_skipped"),
+            "skipped_lines": scan.get("skipped_lines"),
+            "records": scan.get("records"),
+            "messages": scan.get("messages"),
+            "bytes_read": scan.get("bytes_read"),
+            "reading_digest": scan.get("reading_digest"),
+            "day_files": scan.get("day_files") or {},
+            "day_records": day_records,
+        }
 
     payload = {
         "available": False,
@@ -4944,6 +5054,7 @@ def quiet_days(cache, scan, min_tokens=None, tolerance=None):
             written_unknown,
             billed_by_model,
             transcript_by_model,
+            reading=reading,
         ),
         "rows": [],
     }
@@ -5015,6 +5126,7 @@ def quiet_days(cache, scan, min_tokens=None, tolerance=None):
         written_unknown,
         billed_by_model,
         transcript_by_model,
+        reading=reading,
     )
     rows = []
     day = start
@@ -5149,6 +5261,25 @@ def render_quiet(payload):
     else:
         lines.append("  window      none -- the two stores share no day")
     lines.append("")
+    # Printed on every path, including the ones that stop before any day is
+    # judged: a verdict's claim about a corpus is only readable if the corpus
+    # it read is stated, and "no scan in hand" is itself a statement.
+    reading = (payload.get("arbitration") or {}).get("reading") or {}
+    if reading.get("available"):
+        size = reading["bytes"]
+        if size >= 1024 ** 3:
+            size_text = f"{size / (1024 ** 3):.2f} GiB"
+        else:
+            size_text = f"{size / (1024 ** 2):.1f} MiB"
+        read_of = f"{reading['files_read']} file(s) read"
+        if reading["files_skipped"]:
+            read_of += f", {reading['files_skipped']} unreadable"
+        lines.append(
+            f"    reading      {read_of}, {reading['records_parsed']:,} usage record(s), "
+            f"{size_text}, digest {reading['digest']} -- the corpus this verdict read"
+        )
+    elif reading:
+        lines.append(f"    reading      reading not identified -- {reading['reason']}")
     if not payload["available"] or payload["verdict"] in {
         "no_day_table",
         "no_transcripts",
