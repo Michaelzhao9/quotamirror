@@ -4552,6 +4552,13 @@ def _replay_axis(rows, deduped_by_day):
     The share is deliberately refused when no day is witnessed - a dedupe over
     incomplete records measures the loss, not the repeats - and short or absent
     days are counted as excluded rather than pooled into the denominator.
+
+    Refusing the share is not the same as having nothing to say about those
+    days. A short day still holds records, and those records still dedupe, so
+    the repeat rate among the records that survived is measurable - as a rate
+    over the records present, never as a share of the tokens the day bills. It
+    is kept in its own `short_days` block for that reason: pooling it into
+    `replay_share` would make one denominator stand for two different questions.
     """
     block = {
         "available": False,
@@ -4562,8 +4569,46 @@ def _replay_axis(rows, deduped_by_day):
         "deduped_tokens": 0,
         "replay_tokens": 0,
         "replay_share": None,
+        "short_days": {
+            "days": 0,
+            "available": False,
+            "written_tokens": 0,
+            "deduped_tokens": 0,
+            "replay_tokens": 0,
+            "billed_tokens": 0,
+            "share": None,
+            "scope": "records_present",
+            "absent_days": 0,
+            "verdict": "no_short_day",
+            "reason": None,
+        },
         "reason": None,
     }
+    short = block["short_days"]
+    short["absent_days"] = sum(1 for row in rows if row["state"] == "absent")
+    remnant = [row for row in rows if row["state"] == "remnant"]
+    if remnant:
+        written = sum(int(row["record_sum"]) for row in remnant)
+        deduped = sum(int((deduped_by_day or {}).get(row["day"], 0) or 0) for row in remnant)
+        short.update(
+            days=len(remnant),
+            available=True,
+            written_tokens=written,
+            deduped_tokens=deduped,
+            billed_tokens=sum(int(row["receipt"]) for row in remnant),
+        )
+        if deduped > written:
+            # A dedupe cannot add tokens; if it does, the two sides are not
+            # counting the same records and no rate may be printed from them.
+            short["verdict"] = "not_comparable"
+            short["reason"] = (
+                "the deduped total on these days exceeds the records they hold, so the two "
+                "sides do not count the same records"
+            )
+        else:
+            short["replay_tokens"] = written - deduped
+            short["share"] = round(short["replay_tokens"] / written, 4) if written else None
+            short["verdict"] = "repeat_measured" if short["replay_tokens"] else "no_repeat_observed"
     exact = [row for row in rows if row["state"] == "exact"]
     block["days_excluded"] = len(rows) - len(exact)
     if not exact:
@@ -5422,10 +5467,28 @@ def render_quiet(payload):
                     f"{_fmt(replay['written_tokens'])} token(s) written on "
                     f"{replay['days']} day(s) are the same message written again "
                     f"({replay['replay_share']:.1%}); deduped {_fmt(replay['deduped_tokens'])}, "
-                    f"{replay['days_excluded']} day(s) excluded for incomplete records"
+                    f"{replay['days_excluded']} day(s) kept out of this share"
                 )
             elif replay:
                 lines.append(f"    repeat       repeat share not measured -- {replay['reason']}")
+            # A short day's own records still dedupe. That rate answers a
+            # different question than the share above - it divides by the
+            # records present, not by the bill - so it gets its own line and
+            # never enters the number above.
+            short = (replay or {}).get("short_days") or {}
+            if short.get("days"):
+                if short.get("share") is None:
+                    lines.append(
+                        f"    repeat/short not measured on {short['days']} short day(s) -- "
+                        f"{short.get('reason')}"
+                    )
+                else:
+                    lines.append(
+                        f"    repeat/short {_fmt(short['replay_tokens'])} of the "
+                        f"{_fmt(short['written_tokens'])} token(s) {short['days']} short day(s) "
+                        f"hold dedupe away ({short['share']:.1%}) -- a rate over the records "
+                        f"present, not a share of the {_fmt(short['billed_tokens'])} they bill"
+                    )
 
     lines.append(f"  meter check: {block.get('verdict')} -- {block.get('reason')}")
     lines.append(

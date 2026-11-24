@@ -349,10 +349,11 @@ earns the right to compare the record sum with the deduped total: on that day th
 demonstrably complete, so the difference cannot be records that went missing — it is the same
 message written more than once, which is how a streamed response lands in a corpus. The `repeat`
 line prints that difference over the witnessed days only, with the deduped total and the number
-of days kept out for incomplete records:
+of days kept out of this share:
 
 ```
-    repeat       300,000 of 1,000,000 token(s) written on 2 day(s) are the same message written again (30.0%); deduped 700,000, 1 day(s) excluded for incomplete records
+    repeat       300,000 of 1,000,000 token(s) written on 2 day(s) are the same message written again (30.0%); deduped 700,000, 1 day(s) kept out of this share
+    repeat/short 90,000 of the 200,000 token(s) 3 short day(s) hold dedupe away (45.0%) -- a rate over the records present, not a share of the 1,400,000 they bill
 ```
 
 Two refusals sit behind it. With no witnessed day the line reads `repeat share not measured` and
@@ -360,11 +361,27 @@ says why: a dedupe over incomplete records is a floor on the repeat count, not a
 short or absent days are counted as excluded rather than pooled into the denominator, so the
 number describes the days whose evidence survives and nothing else. The verdicts are
 `repeat_measured`, `no_repeat_observed` — a measured zero, printed with the number of days it was
-measured over — and `no_exact_day`. On the corpus this was built against the share is a clear
-majority of the tokens written on witnessed days, which settles what the deduped column means
-there; it does not explain the aggregate factor, because most of the bill sits on short and absent
-days that never enter this measurement. A repeat whose first write landed on a day with missing
-records is outside these numbers in the same way.
+measured over — and `no_exact_day`.
+
+**A short day's records still dedupe, so their repeat rate is measured too — against a different
+denominator.** Refusing the *share* is not the same as having nothing to say: on a short day the
+corpus holds records, and those records still collapse to distinct messages. That rate divides by
+the records present, not by the tokens the receipt bills, so it gets its own line and never enters
+the number above:
+
+```
+    repeat/short 90,000 of the 200,000 token(s) 3 short day(s) hold dedupe away (45.0%) -- a rate over the records present, not a share of the 1,400,000 they bill
+```
+
+The two numbers answer different questions and are printed apart on purpose. On the corpus this was
+built against both rates land in the same broad band — a majority of the written tokens on the exact
+days, and a majority of the surviving ones on the short days — so the repeat rate measured where the
+evidence is complete is not an artefact of picking the good days, and a repeat whose first write
+landed on a short day is no longer outside every number. (The measured figures stay in the run
+report; the examples here are synthetic.) What stays outside is the *bill*: the short days' billed
+tokens are still unattributed, and the line says so by naming the amount it is not a share of.
+`absent` days hold no records at all, are counted in the block (`absent_days`) and contribute
+nothing.
 
 **A witness verdict is a statement about a reading, so the reading is printed.** Two runs of the
 same code over the same window can print a different witness split with nothing in the payload to
@@ -510,9 +527,10 @@ The suite covers receipt reconciliation, unit and cumulative checks, loop dedupl
 
 - `recent` places its window by the newest recorded day, so it measures the last N days *of the store*, not the last N days of wall-clock time; a store that stopped being written three weeks ago reports three weeks ago. Use `--until` to place the window where you meant it, and read the anchor line to see which was used.
 - `recent` cannot tell a quiet day from a day the meter failed to write: both are days with no record, both make the total a floor, and both are printed as `no record`. `--by-day` makes each one visible as a row instead of a date in a comma list, and it makes a run of blank days obvious, but it cannot label them - a store only holds what it wrote, so a holiday and a broken meter leave the same shape. A truly empty window prints no total at all rather than `0`. `quiet` is the one place this is separated, and only where two independent stores both reach: a day the receipt counts messages on is not quiet, whatever the transcripts hold. Outside that intersection nothing is claimed.
-- `quiet` does not say *why* a day carries messages and no tokens. It separates the days the receipt's own token table bills — the number is stated, the transcripts simply do not reach those days — from the days no table states a number for, and refuses to call either quiet. The cause itself (pruned transcripts, a client that writes none, an unmetered day) is still not decidable from the stores, and a transcript total over a window containing billed days is a floor. The `meter check` block does measure the *shape* of the gap on days both meters speak (record sum, deduped, or neither), but it can only rule the repeated-write explanation in or out — when it returns `neither`, the remaining factor is still unattributed, and this command names no cause for it. The `witness` line narrows that remainder without attributing it: on this machine the receipt's day total equals the sum of that day's surviving usage records exactly on every day the corpus still holds them (verified by a recount outside the tool), while the corpus as a whole holds far fewer written tokens inside the receipt's span than the receipt states — so the factor is arithmetic over a lossy denominator, the missing amount is measured, and why those records are gone (pruning, a rotated log, another machine) is not decidable here. The per-day axis says whether agreement holds day by day, not why it fails: a day whose transcript total is far smaller than the receipt's own number is printed, but the reason for that one day (pruned transcripts, a rotated log, a partial write) is still outside what the two stores state. The per-model axis has the same limit in another direction: it can say the gap is spread across every model and that no single factor explains it, but it cannot say what moves the number. A model renamed between receipt versions splits into a receipt-only and a transcript-only row, which is listed rather than merged — merging on a similarity guess would invent an identity nobody wrote. A witness verdict is also a statement about one *reading*: the corpus is mutable, a day that measures `exact` can measure `short` on a later run of the same binary over the same window, and neither payload carries an inventory of the files and records it read, so two readings cannot be compared. The cause of such a drop (files removed, a rotated log, a read that reached less) is not decidable from the output.
+- `quiet` does not say *why* a day carries messages and no tokens. It separates the days the receipt's own token table bills — the number is stated, the transcripts simply do not reach those days — from the days no table states a number for, and refuses to call either quiet. The cause itself (pruned transcripts, a client that writes none, an unmetered day) is still not decidable from the stores, and a transcript total over a window containing billed days is a floor. The `meter check` block does measure the *shape* of the gap on days both meters speak (record sum, deduped, or neither), but it can only rule the repeated-write explanation in or out — when it returns `neither`, the remaining factor is still unattributed, and this command names no cause for it. The `witness` line narrows that remainder without attributing it: on this machine the receipt's day total equals the sum of that day's surviving usage records exactly on every day the corpus still holds them (verified by a recount outside the tool), while the corpus as a whole holds far fewer written tokens inside the receipt's span than the receipt states — so the factor is arithmetic over a lossy denominator, the missing amount is measured, and why those records are gone (pruning, a rotated log, another machine) is not decidable here. The per-day axis says whether agreement holds day by day, not why it fails: a day whose transcript total is far smaller than the receipt's own number is printed, but the reason for that one day (pruned transcripts, a rotated log, a partial write) is still outside what the two stores state. The per-model axis has the same limit in another direction: it can say the gap is spread across every model and that no single factor explains it, but it cannot say what moves the number. A model renamed between receipt versions splits into a receipt-only and a transcript-only row, which is listed rather than merged — merging on a similarity guess would invent an identity nobody wrote. A witness verdict is also a statement about one *reading*: the corpus is mutable, and a day that measures `exact` can measure `short` on a later run of the same binary over the same window. The `reading` line and its `per_day` map are what make those two runs comparable — equal digests mean the same files with the same sizes and mtimes were read, so a moved split is a parsing change rather than a corpus change. What the line cannot do: the digest is local (names and mtimes are facts about this machine), it changes while the corpus is still being written, and `per_day` says *which* files hold a day, not why a record that used to be there is gone. The cause of such a drop (files removed, a rotated log, a read that reached less) is still not decidable from the output.
 
 - `recent` measures tokens, never a share of a plan allowance: no quota ceiling is in the store, and none is assumed.
+- `quiet`'s `repeat/short` rate is measured over the records a short day still holds, and those records may not be a representative sample of what the day wrote: if the missing records were themselves the repeats, this rate understates the day's repeat share, and if they were unique it overstates it. The command prints the amount it divides by and the bill it is not a share of, and it does not correct for the unknown mix — a correction would be a guess wearing a number.
 
 - Receipt field names and shapes are harness-specific and can change.
 - Token values are trusted as written; this is not provider-side billing verification.
