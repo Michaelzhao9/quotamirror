@@ -172,3 +172,33 @@ def test_a_folded_row_keeps_its_label_column():
     value_col = len("  meter check  ")
     assert folded[1].startswith(" " * value_col)
     assert folded[1][value_col] != " "
+
+
+def test_a_billed_day_with_no_record_is_said_on_one_line(tmp_path):
+    """Folding is the fallback, not the plan.
+
+    A row that only fits by being broken after "token(s)" leaves its date on one
+    line and the absence on the next, so the reader has to pair them up. The
+    row's own wording should be short enough to stand on one line at the sizes
+    a real receipt carries.
+    """
+    scan = scan_of(
+        tmp_path,
+        {
+            "a.jsonl": [
+                usage_line("m1", "2026-05-04T10:00:00Z", 1000000),
+                usage_line("m2", "2026-05-06T10:00:00Z", 1000000),
+            ]
+        },
+    )
+    cache = cache_with(
+        [("2026-05-04", 1000000), ("2026-05-05", 991588155), ("2026-05-06", 1000000)],
+        messages=18962,
+    )
+    screen = quotamirror.render_quiet(quotamirror.quiet_days(cache, scan))
+    rows = [line for line in screen.splitlines() if line.strip().startswith("2026-05-05")]
+    assert len(rows) == 1, rows
+    row = rows[0]
+    assert len(row) <= 80, (len(row), row)
+    assert "991,588,155" in row
+    assert "no transcript" in row

@@ -6732,9 +6732,14 @@ def render_quiet(payload):
                     if row["messages"] is not None
                     else "no activity row"
                 )
+                # Saying this in one line is the point, not a style choice: a
+                # row that only fits by breaking after "token(s)" leaves the
+                # date on one line and the absence on the next, and the reader
+                # has to pair them up. "billed" carries the receipt side, so the
+                # verb does the work the dropped words used to do.
                 lines.append(
-                    f"    {row['date']}  {head}  receipt bills {_fmt(row['receipt_tokens'])} "
-                    "token(s)  transcripts hold none"
+                    f"    {row['date']}  {head}  {_fmt(row['receipt_tokens'])} "
+                    "token(s) billed, no transcript"
                 )
             elif row["kind"] == "activity_only":
                 lines.append(

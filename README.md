@@ -526,10 +526,12 @@ value started, a break moves back to a nearby `|` or `--` rather than landing mi
 and a break is never placed between a token carrying a figure and its neighbour, so `silent
 138` and `2.44 GiB` stay on one line. Only whitespace moves: the words are the same words in
 the same order, and the payload — and therefore `--json` — keeps the full sentence, because
-folding is a rendering step and not a measurement. What it cannot do: a row longer than the
-screen still occupies more than one line, and a table row whose own wording is wider than a
-terminal (the per-day billed rows in this corpus are 91 columns) wraps its last words instead
-of being shortened.
+folding is a rendering step and not a measurement. Folding is the fallback, not the plan: a row
+that only fits by being broken leaves its date on one line and its absence on the next, so the
+per-day billed row states its own figure in one line (`991,588,155 token(s) billed, no
+transcript`, 76 columns on the corpus that used to be 91). What it cannot do: a row longer than
+the screen still occupies more than one line, and a token longer than the screen is printed whole
+rather than truncated.
 
 ### `nested` — root and subagent scope
 

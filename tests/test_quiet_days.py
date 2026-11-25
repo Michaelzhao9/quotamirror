@@ -469,7 +469,8 @@ def test_the_days_line_stays_arithmetic_with_a_billed_day(tmp_path):
     assert "receipt bills" in line
     # The day's own number has to be visible, and named as the receipt's.
     assert "5,000" in text
-    assert "receipt bills 5,000 token(s)" in text
+    # The row says it in one line, with the figure still holding its unit.
+    assert "5,000 token(s) billed, no transcript" in row_of(text, "2026-05-03")
 
 
 def test_token_rows_without_a_message_table_are_not_compared(tmp_path):
