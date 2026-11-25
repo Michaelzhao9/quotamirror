@@ -5206,8 +5206,9 @@ def _fit_name(name, room=_CHAIN_NAME_ROOM):
     return name[:head] + "\u2026" + name[-tail:]
 
 _CHAIN_NAMES_LIMIT = (
-    "names are relative to the transcript root, and a rename reads as one name leaving "
-    "while another enters: this follows names, not content"
+    "names are relative to the transcript root, and content is compared only under a name that "
+    "stayed (the manifest's 16-hex sha256), so a rename plus an edit still reads as one name "
+    "leaving while another enters"
 )
 
 
@@ -5225,6 +5226,13 @@ def _chain_names(sides):
     from it and would then look like it left), a manifest whose length
     contradicts its own file count (a partial list dressed as a whole one), and
     fewer than two readings carrying names.
+
+    The manifest also carries a content hash per file, so where a name stayed it
+    can be compared with itself across readings without inventing an identity:
+    the name is the identity. `edited_at` lists the step at which that file's
+    bytes changed. A name whose hash is missing on either side of a step is
+    counted in `content_unmeasured` and never called edited - an absent hash is
+    not a hash that matched.
     """
     block = {
         "available": False,
@@ -5238,6 +5246,8 @@ def _chain_names(sides):
         "left": 0,
         "blink": 0,
         "changed": 0,
+        "edited": 0,
+        "content_unmeasured": 0,
         "readings_named": 0,
     }
     present = [side for side in sides if side["present"]]
@@ -5273,11 +5283,17 @@ def _chain_names(sides):
     indices = [side["index"] for side in present]
     first_index, last_index = indices[0], indices[-1]
     seen = {}
+    hashes = {}
     for side in named:
         for item in side["manifest"] or []:
             if not item:
                 continue
-            seen.setdefault(item[0], set()).add(side["index"])
+            name = item[0]
+            seen.setdefault(name, set()).add(side["index"])
+            digest = item[3] if len(item) > 3 else None
+            hashes.setdefault(name, {})[side["index"]] = (
+                digest.strip() if isinstance(digest, str) and digest.strip() else None
+            )
 
     rows = []
     for name, steps in sorted(seen.items()):
@@ -5296,6 +5312,21 @@ def _chain_names(sides):
             state = "left"
         else:
             state = "blink"
+        by_step = hashes.get(name) or {}
+        edited_at = []
+        unmeasured = False
+        for position in range(len(ordered) - 1):
+            before, later = ordered[position], ordered[position + 1]
+            # Only neighbouring readings compare content: a name that was absent
+            # in between is a return, and its bytes on either side of the gap say
+            # nothing about the step it came back on.
+            if later != before + 1:
+                continue
+            was, now = by_step.get(before), by_step.get(later)
+            if not was or not now:
+                unmeasured = True
+            elif was != now:
+                edited_at.append(later)
         rows.append(
             {
                 "name": name,
@@ -5303,6 +5334,8 @@ def _chain_names(sides):
                 "steps": ordered,
                 "entered_at": ordered[0] if ordered[0] != first_index else None,
                 "left_at": left_at if state in {"left", "blink"} else None,
+                "edited_at": edited_at,
+                "content_unmeasured": unmeasured,
             }
         )
     block["available"] = True
@@ -5312,7 +5345,17 @@ def _chain_names(sides):
     block["left"] = sum(1 for row in rows if row["state"] == "left")
     block["blink"] = sum(1 for row in rows if row["state"] == "blink")
     block["changed"] = block["entered"] + block["left"] + block["blink"]
-    block["verdict"] = "names_changed" if block["changed"] else "names_stable"
+    block["edited"] = sum(1 for row in rows if row["edited_at"])
+    block["content_unmeasured"] = sum(1 for row in rows if row["content_unmeasured"])
+    if block["changed"]:
+        block["verdict"] = "names_changed"
+    elif block["edited"]:
+        # The name set held, but bytes under it did not: calling that
+        # `names_stable` would print an all-clear beside a pair that says
+        # otherwise on the same screen.
+        block["verdict"] = "names_held_content_moved"
+    else:
+        block["verdict"] = "names_stable"
     return block
 
 
@@ -5557,18 +5600,36 @@ def _chain_lines(chain, width=80):
         )
     names = chain.get("names") or {}
     if names.get("available"):
-        wrap(
-            "    names        ",
+        summary = (
             f"{len(names['files'])} file name(s) across {names['readings_named']} reading(s): "
             f"{names['throughout']} in every reading, {names['entered']} entered, "
-            f"{names['left']} left, {names['blink']} blinked",
+            f"{names['left']} left, {names['blink']} blinked"
         )
-        changed = [item for item in names["files"] if item["state"] != "throughout"]
+        if names.get("edited"):
+            summary += f", {names['edited']} edited in place"
+        if names.get("content_unmeasured"):
+            summary += f", {names['content_unmeasured']} with no content hash"
+        wrap("    names        ", summary)
+        changed = [
+            item
+            for item in names["files"]
+            if item["state"] != "throughout" or item.get("edited_at")
+        ]
         shortened = 0
         for item in changed[: _CHAIN_NAME_ROWS]:
             shown = _fit_name(item["name"])
             if shown != item["name"]:
                 shortened += 1
+            edits = item.get("edited_at") or []
+            tail = ""
+            if edits:
+                where = (
+                    f"reading {edits[0]}"
+                    if len(edits) == 1
+                    else "readings " + ", ".join(str(i) for i in edits)
+                )
+                tail = f", bytes changed on {where}"
+            label = item["state"]
             if item["state"] == "entered":
                 if item["entered_at"] == item["steps"][-1]:
                     text = f"{shown} -- entered on reading {item['entered_at']}, the last reading"
@@ -5582,7 +5643,7 @@ def _chain_lines(chain, width=80):
                     f"{shown} -- last on reading {item['steps'][-1]}, "
                     f"absent on reading {item['left_at']}"
                 )
-            else:
+            elif item["state"] == "blink":
                 lost = [
                     index
                     for index in range(item["steps"][0], item["steps"][-1] + 1)
@@ -5592,7 +5653,16 @@ def _chain_lines(chain, width=80):
                     f"{shown} -- on reading(s) {', '.join(str(i) for i in item['steps'])}, "
                     f"absent on {', '.join(str(i) for i in lost)}"
                 )
-            wrap(f"    {item['state']:<13}", " " + text)
+            else:
+                # The name held and only its bytes moved, so the step is the
+                # whole statement: saying "in every reading" alone would be an
+                # all-clear beside a pair that found different bytes.
+                label = "edited"
+                text = (
+                    f"{shown} -- same name on reading(s) "
+                    f"{', '.join(str(i) for i in item['steps'])}"
+                )
+            wrap(f"    {label:<13}", " " + text + tail)
         hidden = len(changed) - _CHAIN_NAME_ROWS
         if hidden > 0:
             wrap("    ", f" +{hidden} more name(s) changed; the full list is in --json")

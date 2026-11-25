@@ -162,3 +162,133 @@ def test_a_name_that_enters_on_the_last_reading_is_not_held_to_it():
     text = "\n".join(quotamirror._chain_lines(chain))
     assert "held to reading 3" not in text
     assert "entered on reading 3, the last reading" in text
+
+
+# --- content under an unchanged name ---------------------------------------
+#
+# A manifest entry carries a content hash, so two readings that hold the same
+# name can be compared byte for byte for that file without inventing identity:
+# the name is the identity. Before this, a chain could say "different bytes"
+# twice and still print "7 in every reading", leaving out the two files that
+# actually changed.
+
+
+def screen(chain):
+    """The rendered chain with wrapping collapsed to single spaces."""
+    return " ".join(" ".join(quotamirror._chain_lines(chain)).split())
+
+
+def reading_of(hashes, records=2):
+    """A reading whose manifest carries one content hash per name."""
+    listing = sorted(entry(name, digest=digest) for name, digest in hashes.items())
+    content = "c" + str(abs(hash(tuple(sorted(hashes.items())))) % 100000)
+    return {
+        "files": len(listing),
+        "bytes": 10 * len(listing),
+        "records": records,
+        "digest": "path-" + content,
+        "content_digest": content,
+        "digest_basis": "name+size+mtime_ns",
+        "content_basis": "name+sha256(bytes)",
+        "manifest": listing,
+        "manifest_total": len(listing),
+        "manifest_truncated": False,
+    }
+
+
+def test_a_file_edited_under_the_same_name_is_named_with_the_step_it_changed():
+    chain = quotamirror.reading_chain(
+        [
+            reading_of({"a.jsonl": "1111111111111111", "b.jsonl": "2222222222222222"}),
+            reading_of({"a.jsonl": "9999999999999999", "b.jsonl": "2222222222222222"}),
+        ],
+        reading_of({"a.jsonl": "9999999999999999", "b.jsonl": "2222222222222222"}),
+    )
+    names = chain["names"]
+    assert names["available"] is True
+    assert row(chain, "a.jsonl")["state"] == "throughout"
+    assert row(chain, "a.jsonl")["edited_at"] == [2]
+    assert row(chain, "b.jsonl")["edited_at"] == []
+    assert names["edited"] == 1
+
+
+def test_names_that_held_while_their_bytes_moved_are_not_called_stable():
+    chain = quotamirror.reading_chain(
+        [
+            reading_of({"a.jsonl": "1111111111111111"}),
+            reading_of({"a.jsonl": "9999999999999999"}),
+        ],
+        reading_of({"a.jsonl": "9999999999999999"}),
+    )
+    names = chain["names"]
+    assert names["changed"] == 0
+    assert names["verdict"] == "names_held_content_moved"
+
+
+def test_the_names_line_counts_edits_beside_entries_and_exits():
+    chain = quotamirror.reading_chain(
+        [
+            reading_of({"a.jsonl": "1111111111111111"}),
+            reading_of({"a.jsonl": "9999999999999999"}),
+        ],
+        reading_of({"a.jsonl": "9999999999999999"}),
+    )
+    assert "1 edited in place" in screen(chain)
+
+
+def test_the_edited_name_is_printed_with_the_step_its_bytes_changed():
+    chain = quotamirror.reading_chain(
+        [
+            reading_of({"a.jsonl": "1111111111111111"}),
+            reading_of({"a.jsonl": "9999999999999999"}),
+        ],
+        reading_of({"a.jsonl": "9999999999999999"}),
+    )
+    text = screen(chain)
+    assert "edited a.jsonl" in text
+    assert "bytes changed on reading 2" in text
+
+
+def test_a_manifest_entry_without_a_content_hash_is_not_called_edited():
+    chain = quotamirror.reading_chain(
+        [
+            reading_of({"a.jsonl": "1111111111111111"}),
+            reading_of({"a.jsonl": ""}),
+        ],
+        reading_of({"a.jsonl": ""}),
+    )
+    names = chain["names"]
+    assert row(chain, "a.jsonl")["edited_at"] == []
+    assert names["edited"] == 0
+    assert names["content_unmeasured"] == 1
+    assert names["verdict"] == "names_stable"
+    assert "1 with no content hash" in screen(chain)
+
+
+def test_a_file_that_entered_and_was_then_edited_says_both():
+    chain = quotamirror.reading_chain(
+        [
+            reading_of({"a.jsonl": "1111111111111111"}),
+            reading_of({"a.jsonl": "1111111111111111", "b.jsonl": "2222222222222222"}),
+        ],
+        reading_of({"a.jsonl": "1111111111111111", "b.jsonl": "3333333333333333"}),
+    )
+    item = row(chain, "b.jsonl")
+    assert item["state"] == "entered"
+    assert item["edited_at"] == [3]
+    text = screen(chain)
+    assert "entered on reading 2" in text
+    assert "bytes changed on reading 3" in text
+
+
+def test_no_names_line_is_wider_than_the_screen_when_a_long_name_is_edited():
+    long_name = "0d6af2d3-4f5f-4283-bb21-bf2baf8be988-some-rather-long-transcript-name.jsonl"
+    chain = quotamirror.reading_chain(
+        [
+            reading_of({long_name: "1111111111111111", "b.jsonl": "2222222222222222"}),
+            reading_of({long_name: "9999999999999999", "b.jsonl": "2222222222222222"}),
+        ],
+        reading_of({long_name: "9999999999999999", "b.jsonl": "2222222222222222"}),
+    )
+    for line in quotamirror._chain_lines(chain):
+        assert len(line) <= 80, line
