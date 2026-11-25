@@ -18,6 +18,26 @@ import json
 import quotamirror
 
 
+def row_of(text, label):
+    """The row starting with `label`, with the lines it folded into joined back.
+
+    A row wider than the screen is printed on more than one line, indented to
+    the column where its first value starts, so a test that reads a row has to
+    read the whole of it rather than its first line.
+    """
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip().startswith(label):
+            parts = [line.strip()]
+            for following in lines[index + 1 :]:
+                indent = len(following) - len(following.lstrip())
+                if not following.strip() or indent < 8:
+                    break
+                parts.append(following.strip())
+            return " ".join(parts)
+    raise AssertionError(f"no row for {label!r} in:\n{text}")
+
+
 def cache_with(days, last_computed=None, tokens=None):
     """A receipt carrying only the fields this command reads.
 
@@ -443,7 +463,7 @@ def test_the_days_line_stays_arithmetic_with_a_billed_day(tmp_path):
     result = quotamirror.quiet_days(cache_with(days, tokens=[("2026-05-03", 5000)]), scan)
     text = quotamirror.render_quiet(result)
 
-    line = next(line for line in text.splitlines() if line.strip().startswith("DAYS:"))
+    line = row_of(text, "DAYS:")
     numbers = [int(part.split()[-1]) for part in line.split("|")]
     assert sum(numbers) == result["days_in_window"] == 5
     assert "receipt bills" in line
@@ -491,11 +511,10 @@ def test_the_two_sides_totals_are_printed_and_marked_as_different_measures(tmp_p
     )
     text = quotamirror.render_quiet(result)
 
-    totals = [line for line in text.splitlines() if line.strip().startswith("totals")]
-    assert len(totals) == 1
-    assert "4,000" in totals[0]
-    assert "1,000" in totals[0]
-    assert "not the same measure" in totals[0]
+    totals = row_of(text, "totals")
+    assert "4,000" in totals
+    assert "1,000" in totals
+    assert "not the same measure" in totals
     # The difference is now measured, not left to the reader: this fixture has
     # one day below the default floor, so the check refuses to decide.
     check = [line for line in text.splitlines() if line.strip().startswith("meter check:")]

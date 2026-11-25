@@ -517,6 +517,20 @@ Measured totals are read from each side's own table — `measured_tokens` is the
 scan's day entries and `transcript_tokens_in_window` is the same number by construction, so
 this command cannot become a second accounting of the same corpus.
 
+**No line is wider than the screen.** Since 0.55.0 every line `quiet` prints fits in 80
+columns. Before that only the chain's rows were wrapped: the rest of the screen was assembled
+as whole lines, and on a real corpus 22 of the 45 lines a run printed were wider than a
+terminal, the widest 254 — a figure off the right edge is a figure the reader cannot check.
+A row that has to fold keeps its label column and continues under the column where its first
+value started, a break moves back to a nearby `|` or `--` rather than landing mid-sentence,
+and a break is never placed between a token carrying a figure and its neighbour, so `silent
+138` and `2.44 GiB` stay on one line. Only whitespace moves: the words are the same words in
+the same order, and the payload — and therefore `--json` — keeps the full sentence, because
+folding is a rendering step and not a measurement. What it cannot do: a row longer than the
+screen still occupies more than one line, and a table row whose own wording is wider than a
+terminal (the per-day billed rows in this corpus are 91 columns) wraps its last words instead
+of being shortened.
+
 ### `nested` — root and subagent scope
 
 ```bash

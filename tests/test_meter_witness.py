@@ -148,7 +148,7 @@ def test_quiet_text_prints_the_witness_split(tmp_path):
     text = quotamirror.render_quiet(payload)
     assert "witness" in text
     assert "1 day(s) exact" in text
-    assert "exact where evidence survives" in text
+    assert "exact where evidence survives" in " ".join(text.split())
 
 
 def test_a_short_day_is_json_serialisable_and_named_as_a_string(tmp_path):

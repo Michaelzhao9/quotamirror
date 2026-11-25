@@ -6384,6 +6384,121 @@ def _quiet_days(cache, scan, min_tokens=None, tolerance=None):
     return payload
 
 
+def _carries_figure(token):
+    """True when a token carries a digit, so it keeps its neighbour on the line."""
+    return any(ch.isdigit() for ch in token)
+
+
+def _label_prefix(line, max_words=3):
+    """Everything before the first value, by this screen's own convention.
+
+    A label word is followed by one space and the value starts after a gap of
+    two or more, so `    reading      937 ...` puts its value in column 17 while
+    `  meter check  27 ...` puts it in column 15. A token that carries a figure
+    always starts the value, so a number is never absorbed into the label.
+    """
+    words = [(match.start(), match.group()) for match in re.finditer(r"\S+", line)]
+    if not words:
+        return ""
+    end = words[0][0] + len(words[0][1])
+    taken = 1
+    for start, token in words[1:]:
+        gap = start - end
+        if taken >= max_words or gap >= 2 or _carries_figure(token):
+            break
+        end = start + len(token)
+        taken += 1
+    rest = line[end:]
+    gap = len(rest) - len(rest.lstrip())
+    return line[: end + max(gap, 1)]
+
+
+def _repair_cut(current, word, head, width):
+    """Move a mid-clause break back to the clause boundary beside it.
+
+    Greedy filling already breaks at a pipe when the pipe is where the line
+    runs out, so a row built from `term | term | term` needs nothing here. The
+    damage is a break in the middle of a sentence: `... are not the` /
+    `same measure` separates two words that belong together, and the row it
+    came from was two clauses with a `--` between them. So when the natural
+    break lands mid-clause, the last pipe or dash that still fills at least
+    half the screen becomes the break instead. Nothing is moved when there is
+    no such separator, since a greedy break is then the only one there is.
+    """
+    if word in {"|", "--"} or current[-1] == "|":
+        return None
+    floor = width // 2
+    best = None
+    for index, token in enumerate(current):
+        cut = index + 1 if token == "|" else index if token == "--" else None
+        if cut is None or cut < 1 or cut > len(current):
+            continue
+        if len(head + " ".join(current[:cut])) < floor:
+            continue
+        best = cut
+    return best
+
+
+def _fold_lines(lines, width=80):
+    """Fold any line wider than `width`, keeping the label column.
+
+    The chain wraps its own rows under a label; every other line of the same
+    screen was assembled as one f-string and nothing measured it, so on a real
+    corpus 22 of the 45 lines `quiet` prints were wider than a terminal (the
+    widest 254). A number printed off the right edge is a number the reader
+    cannot check, which is why the chain had a width guard and this screen did
+    not.
+
+    The label keeps its column and the continuation is indented to where the
+    first value started, so a folded row still reads as one row. A break is not
+    placed between a token that carries a figure and its neighbour: `silent 138`
+    and `2.44 GiB` travel together, because a figure separated from its label or
+    its unit is the reading this tool refuses elsewhere.
+
+    Only whitespace moves. The words are the same words in the same order, so
+    folding loses nothing; a token longer than the whole screen is printed as it
+    is, since truncating it would hide the figure instead.
+    """
+    folded = []
+    for line in lines:
+        if len(line) <= width or not line.strip():
+            folded.append(line)
+            continue
+        prefix = _label_prefix(line)
+        words = line[len(prefix) :].split()
+        if not prefix or not words:
+            folded.append(line)
+            continue
+        pad = " " * len(prefix)
+        out = []
+        current = [words[0]]
+        for word in words[1:]:
+            head = prefix if not out else pad
+            if len(head + " ".join([*current, word])) <= width:
+                current.append(word)
+                continue
+            cut = _repair_cut(current, word, head, width)
+            if cut:
+                out.append(head + " ".join(current[:cut]))
+                current = [*current[cut:], word]
+                continue
+            if len(current) >= 2 and (
+                _carries_figure(current[-1]) or _carries_figure(word)
+            ):
+                moved = current.pop()
+                out.append(head + " ".join(current))
+                head = prefix if not out else pad
+                current = [moved]
+                if len(head + " ".join([*current, word])) <= width:
+                    current.append(word)
+                    continue
+            out.append(head + " ".join(current))
+            current = [word]
+        out.append((prefix if not out else pad) + " ".join(current))
+        folded.extend(out)
+    return folded
+
+
 def render_quiet(payload):
     lines = ["SILENT DAYS (which days are quiet, and which only look quiet)", ""]
     lines.append(f"  receipt     {_range(*payload['receipt_span']) if payload['receipt_span'] else 'none'}")
@@ -6443,7 +6558,7 @@ def render_quiet(payload):
     }:
         lines.append(f"  not measured -- {payload['reason']}")
         lines.append(f"VERDICT: {payload['verdict']}")
-        return "\n".join(lines) + "\n"
+        return "\n".join(_fold_lines(lines)) + "\n"
 
     parts = [
         f"measured {payload['days_measured']}",
@@ -6639,7 +6754,7 @@ def render_quiet(payload):
     lines.append("")
     lines.append(f"VERDICT: {payload['verdict']}")
     lines.append(f"  {payload['reason']}")
-    return "\n".join(lines) + "\n"
+    return "\n".join(_fold_lines(lines)) + "\n"
 
 
 RECENT_DAYS_DEFAULT = 7

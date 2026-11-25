@@ -15,6 +15,26 @@ import json
 import quotamirror
 
 
+def row_of(text, label):
+    """The row starting with `label`, with the lines it folded into joined back.
+
+    A row wider than the screen is printed on more than one line, indented to
+    the column where its first value starts, so a test that reads a row has to
+    read the whole of it rather than its first line.
+    """
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip().startswith(label):
+            parts = [line.strip()]
+            for following in lines[index + 1 :]:
+                indent = len(following) - len(following.lstrip())
+                if not following.strip() or indent < 8:
+                    break
+                parts.append(following.strip())
+            return " ".join(parts)
+    raise AssertionError(f"no row for {label!r} in:\n{text}")
+
+
 def cache_with(tokens):
     return {
         "version": 3,
@@ -193,7 +213,7 @@ def test_the_extreme_days_carry_their_dates(tmp_path):
     assert block["max_day"] == "2026-05-04"
     assert block["min_day"] == "2026-05-05"
     text = quotamirror.render_quiet(result)
-    per_day = next(line for line in text.splitlines() if "per day" in line)
+    per_day = row_of(text, "per day")
     assert "2026-05-04" in per_day and "2026-05-05" in per_day
 
 
@@ -213,7 +233,6 @@ def test_the_per_day_line_is_printed(tmp_path):
         min_tokens=0,
     )
     text = quotamirror.render_quiet(result)
-    per_day = [line for line in text.splitlines() if "per day" in line]
-    assert per_day, text
-    assert "0 of 2" in per_day[0]
-    assert "aggregate_only" in per_day[0]
+    per_day = row_of(text, "per day")
+    assert "0 of 2" in per_day
+    assert "aggregate_only" in per_day
