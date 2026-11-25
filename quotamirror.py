@@ -4874,6 +4874,47 @@ def _manifest_index(entries):
     return {name: (size, mtime_ns, digest) for name, size, mtime_ns, digest in entries}
 
 
+def _pair_moves(added, removed, now_index, prior_index):
+    """Pair a vanished name with a new one that carries the same bytes.
+
+    A rename arrives as one `added` plus one `removed` - the same shape an add
+    beside a delete takes. Size and content hash are already in the manifest,
+    so the pair can be named as a move, but only when the pairing is forced:
+    two files with identical content on either side make every pairing a guess,
+    and a guessed subject is worse than a counted one.
+    """
+
+    def content_of(name, index):
+        size, _mtime, digest = index[name]
+        return (size, digest)
+
+    by_added = {}
+    for name in added:
+        by_added.setdefault(content_of(name, now_index), []).append(name)
+    by_removed = {}
+    for name in removed:
+        by_removed.setdefault(content_of(name, prior_index), []).append(name)
+
+    moved = []
+    paired_added = set()
+    paired_removed = set()
+    ambiguous = 0
+    for content, new_names in by_added.items():
+        old_names = by_removed.get(content) or []
+        if not old_names:
+            continue
+        if len(new_names) == 1 and len(old_names) == 1:
+            moved.append({"from": old_names[0], "to": new_names[0], "size": content[0]})
+            paired_added.add(new_names[0])
+            paired_removed.add(old_names[0])
+        else:
+            ambiguous += len(new_names)
+    moved.sort(key=lambda row: row["from"])
+    left_added = [name for name in added if name not in paired_added]
+    left_removed = [name for name in removed if name not in paired_removed]
+    return moved, left_added, left_removed, ambiguous
+
+
 def _name_changes(current, prior):
     """Name the files behind a moved digest, or say exactly why naming stopped.
 
@@ -4894,6 +4935,9 @@ def _name_changes(current, prior):
         "added_total": 0,
         "removed": [],
         "removed_total": 0,
+        "moved": [],
+        "moved_total": 0,
+        "moved_ambiguous_total": 0,
     }
     now_manifest = (current or {}).get("manifest")
     prior_manifest = (prior or {}).get("manifest") if isinstance(prior, dict) else None
@@ -4959,6 +5003,10 @@ def _name_changes(current, prior):
         )
         return attribution
     attribution["available"] = True
+    moved, added, removed, ambiguous = _pair_moves(added, removed, now_index, prior_index)
+    attribution["moved"] = moved[:ATTRIBUTION_LIMIT]
+    attribution["moved_total"] = len(moved)
+    attribution["moved_ambiguous_total"] = ambiguous
     attribution["mtime_only"] = mtime_only[:ATTRIBUTION_LIMIT]
     attribution["mtime_only_total"] = len(mtime_only)
     attribution["content_changed"] = content_changed[:ATTRIBUTION_LIMIT]
@@ -5164,7 +5212,13 @@ def _compare_lines(block, width=80):
     if not attribution.get("available"):
         emit("named", "not measured -- " + (attribution.get("reason") or "no manifest"))
         return lines
-    moved = []
+    parts = []
+    if attribution.get("moved_total"):
+        rows = attribution.get("moved") or []
+        total = attribution["moved_total"]
+        shown = ", ".join(f"{row['from']} -> {row['to']}" for row in rows)
+        more = f" (+{total - len(rows)} more)" if total > len(rows) else ""
+        parts.append(f"moved {total}: {shown}{more}")
     for key, label in (
         ("mtime_only", "touched"),
         ("content_changed", "edited"),
@@ -5177,8 +5231,15 @@ def _compare_lines(block, width=80):
         names = attribution.get(key) or []
         shown = ", ".join(names)
         more = f" (+{total - len(names)} more)" if total > len(names) else ""
-        moved.append(f"{label} {total}: {shown}{more}")
-    emit("named", "; ".join(moved) if moved else "no file in the shared manifest moved")
+        parts.append(f"{label} {total}: {shown}{more}")
+    emit("named", "; ".join(parts) if parts else "no file in the shared manifest moved")
+    ambiguous = attribution.get("moved_ambiguous_total") or 0
+    if ambiguous:
+        emit(
+            "unpaired",
+            f"{ambiguous} file(s) share content with a missing name but cannot be paired "
+            "one-to-one, so they stay counted as added and removed",
+        )
     return lines
 
 
