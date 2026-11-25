@@ -5148,6 +5148,281 @@ def _compare_readings(current, prior):
     return block
 
 
+_CHAIN_ORDER_NOTE = (
+    "no reading stamps when it was taken, so the order below is the order handed in "
+    "(oldest first) and is the caller's claim, not a measured sequence"
+)
+
+
+def _chain_side(row, index, label):
+    """One reading as the chain sees it: counts, digests, and whether it exists.
+
+    Two vocabularies meet here for the same reason `_PRIOR_KEYS` exists: a saved
+    reading says `files`/`records`, while the block this run builds says
+    `files_read`/`records_parsed`. Reading only the saved names would leave every
+    delta against the current run unmeasured - the pair a reader trusts most.
+    """
+    row = row or {}
+
+    def first(*keys):
+        for key in keys:
+            if row.get(key) is not None:
+                return row[key]
+        return None
+
+    return {
+        "index": index,
+        "label": label,
+        "present": bool(row),
+        "files": first("files_read", "files"),
+        "bytes": first("bytes", "bytes_read"),
+        "records": first("records_parsed", "records"),
+        "digest": first("digest", "reading_digest"),
+        "content_digest": row.get("content_digest"),
+    }
+
+
+def _chain_pair(now, prior):
+    """Classify two neighbouring readings with the same rule a single pair gets.
+
+    A pair needs a byte axis on *both* sides. `_compare_readings` refuses a prior
+    without one, but a new reading with no content digest would otherwise fall
+    through to a size comparison and read as a change; in a chain that would be
+    a step invented at the position that has the least to say.
+    """
+    for side, name in ((now, "the later reading"), (prior, "the earlier reading")):
+        if not side.get("content_digest"):
+            return {
+                "available": False,
+                "verdict": "not_comparable",
+                "content_equal": None,
+                "files_delta": None,
+                "bytes_delta": None,
+                "records_delta": None,
+                "reason": (
+                    f"{name} of the pair carries no content_digest, so there is no byte axis "
+                    "on that side"
+                ),
+            }
+    return _compare_readings(
+        {
+            "available": True,
+            "files_read": now["files"],
+            "bytes": now["bytes"],
+            "records_parsed": now["records"],
+            "digest": now["digest"],
+            "content_digest": now["content_digest"],
+        },
+        prior,
+    )
+
+
+def reading_chain(priors, current):
+    """Walk a sequence of readings, classifying each neighbouring pair.
+
+    A pair verdict says what changed between two readings. It cannot say *which*
+    of a sequence of readings is the one that moved, and it silently drops a
+    reading in the middle that carries no byte axis. This block answers both by
+    walking the supplied readings in the order handed in:
+
+    * one row per neighbouring pair, classified by `_compare_readings`, so the
+      words are the ones the single-pair comparison already prints;
+    * `verdict` in one word: `no_byte_moved` (every pair's content digest
+      matched), `bytes_moved` (at least one did not), or `hole` (some reading
+      could not be compared, so the chain is not a chain across it). A hole is
+      named by position rather than skipped, because a three-reading chain that
+      quietly compares as two is a wrong statement about which step moved;
+    * `repeated_pairs` - positions whose content digests are equal while a pair
+      between them differs. That is either a change that was undone or two
+      trees that happen to hold the same bytes; the readings cannot separate
+      those, so the count carries no cause. A pair whose counts contradict its
+      equal digest is *not* counted as a return - it goes to `contradictions`.
+
+    Nothing about the ordering is measured: a reading holds no timestamp, so the
+    sequence is the caller's claim and `order_note` says so in every payload.
+    """
+    priors = list(priors or [])
+    block = {
+        "available": False,
+        "verdict": "not_a_chain",
+        "reason": None,
+        "order": "as_given",
+        "order_note": _CHAIN_ORDER_NOTE,
+        "readings": [],
+        "pairs": [],
+        "changed_pairs": 0,
+        "hole_pairs": 0,
+        "repeated_pairs": [],
+        "repeated_total": 0,
+        "contradiction_total": 0,
+    }
+    sides = [_chain_side(row, index + 1, str(index + 1)) for index, row in enumerate(priors)]
+    sides.append(_chain_side(current, len(priors) + 1, "this run"))
+    block["readings"] = sides
+    if len(priors) < 2:
+        block["reason"] = (
+            "fewer than two prior readings were handed in, so there is no chain to walk: "
+            "one prior reading is the pair comparison above"
+        )
+        return block
+    block["available"] = True
+    missing = [side["index"] for side in sides if not side["present"]]
+    blind = [
+        side["index"]
+        for side in sides
+        if side["present"] and not side.get("content_digest")
+    ]
+    for position in range(len(sides) - 1):
+        left, right = sides[position], sides[position + 1]
+        if not left["present"] or not right["present"]:
+            block["pairs"].append(
+                {
+                    "from": left["index"],
+                    "to": right["index"],
+                    "verdict": "not_comparable",
+                    "available": False,
+                    "same_bytes": None,
+                    "files_delta": None,
+                    "bytes_delta": None,
+                    "records_delta": None,
+                    "reason": "this position holds no reading",
+                }
+            )
+            continue
+        pair = _chain_pair(right, left)
+        block["pairs"].append(
+            {
+                "from": left["index"],
+                "to": right["index"],
+                "verdict": pair["verdict"],
+                "available": bool(pair.get("available")),
+                "same_bytes": pair.get("content_equal"),
+                "files_delta": pair.get("files_delta"),
+                "bytes_delta": pair.get("bytes_delta"),
+                "records_delta": pair.get("records_delta"),
+                "reason": pair.get("reason"),
+            }
+        )
+    block["changed_pairs"] = sum(1 for pair in block["pairs"] if pair["same_bytes"] is False)
+    block["hole_pairs"] = sum(1 for pair in block["pairs"] if not pair["available"])
+    for i, left in enumerate(sides):
+        for right in sides[i + 2 :]:
+            if not left["present"] or not right["present"]:
+                continue
+            if not left.get("content_digest") or not right.get("content_digest"):
+                continue
+            if left["content_digest"] != right["content_digest"]:
+                continue
+            counts_differ = any(
+                left.get(name) is not None
+                and right.get(name) is not None
+                and left[name] != right[name]
+                for name in ("files", "records")
+            )
+            if counts_differ:
+                block["contradiction_total"] += 1
+                continue
+            block["repeated_pairs"].append([left["index"], right["index"]])
+    block["repeated_total"] = len(block["repeated_pairs"])
+    if missing:
+        block["verdict"] = "hole"
+        block["reason"] = (
+            f"position {', '.join(str(index) for index in missing)} of the sequence holds no "
+            "reading, so the pairs on either side of it were not compared"
+        )
+    elif blind:
+        block["verdict"] = "hole"
+        block["reason"] = (
+            f"position {', '.join(str(index) for index in blind)} carries no content_digest, "
+            "so the pairs on both sides of it have no byte axis to compare"
+        )
+    elif block["changed_pairs"]:
+        block["verdict"] = "bytes_moved"
+    else:
+        block["verdict"] = "no_byte_moved"
+    return block
+
+
+_CHAIN_VERDICT_TEXT = {
+    "no_byte_moved": "every neighbouring pair holds the same bytes -- no edit along the chain",
+    "bytes_moved": "at least one neighbouring pair holds different bytes",
+    "hole": "the chain is not connected across every position, so it says nothing about a step",
+    "not_a_chain": "fewer than two prior readings, so nothing was walked",
+}
+
+
+def _chain_lines(chain, width=80):
+    """Render the chain, or a sentence saying why there is none."""
+    if not chain:
+        return []
+    lines = []
+
+    def wrap(head, text):
+        if len(head + text) <= width:
+            lines.append(head + text)
+            return
+        current = head
+        pad = " " * len(head)
+        for word in text.split():
+            if current.strip() and len(current) + 1 + len(word) > width:
+                lines.append(current.rstrip())
+                current = pad + word
+            else:
+                current += (" " if current.strip() else "") + word
+        lines.append(current.rstrip())
+
+    if not chain.get("available"):
+        wrap("    chain        ", "not measured -- " + (chain.get("reason") or "no chain"))
+        return lines
+    wrap(
+        "    chain        ",
+        f"{len(chain['readings'])} reading(s) walked oldest first, "
+        f"{len(chain['pairs'])} neighbouring pair(s)",
+    )
+    wrap("    order        ", chain["order_note"])
+    for pair in chain["pairs"]:
+        left = chain["readings"][pair["from"] - 1]["label"]
+        right = chain["readings"][pair["to"] - 1]["label"]
+        if pair["available"]:
+            deltas = ", ".join(
+                f"{name} {'n/a' if pair[key] is None else f'{pair[key]:+d}'}"
+                for name, key in (
+                    ("files", "files_delta"),
+                    ("bytes", "bytes_delta"),
+                    ("records", "records_delta"),
+                )
+            )
+            text = f"{pair['verdict']} ({deltas})"
+        else:
+            text = f"not compared -- {pair.get('reason') or 'no byte axis'}"
+        wrap(f"    {left} -> {right}", "  " + text)
+    verdict = chain["verdict"]
+    summary = (
+        f"{verdict} -- {_CHAIN_VERDICT_TEXT.get(verdict, '')}; "
+        f"{chain['changed_pairs']} of {len(chain['pairs'])} pair(s) moved bytes"
+    )
+    if chain["hole_pairs"]:
+        summary += f", {chain['hole_pairs']} not compared"
+    if chain["reason"]:
+        summary += f" -- {chain['reason']}"
+    wrap("    chain verdict", " " + summary)
+    if chain["repeated_total"]:
+        spots = ", ".join(f"{left} and {right}" for left, right in chain["repeated_pairs"])
+        wrap(
+            "    returned     ",
+            f"reading(s) {spots} hold bytes already seen, with a different pair in between "
+            "-- an edit that was undone or another tree with the same bytes; the readings "
+            "cannot say which",
+        )
+    if chain["contradiction_total"]:
+        wrap(
+            "    unpaired     ",
+            f"{chain['contradiction_total']} pair(s) of readings hold the same content digest "
+            "but a different count, so they are not counted as a return",
+        )
+    return lines
+
+
 def _as_int(value):
     try:
         return int(value)
@@ -5525,7 +5800,7 @@ def _quiet_meter_check(
     return block
 
 
-def quiet_days(cache, scan, min_tokens=None, tolerance=None, prior=None):
+def quiet_days(cache, scan, min_tokens=None, tolerance=None, prior=None, priors=None):
     """Name the days each of two stores is silent on, and compare readings.
 
     `_quiet_days` decides the days; this wrapper adds the comparison of the
@@ -5533,10 +5808,19 @@ def quiet_days(cache, scan, min_tokens=None, tolerance=None, prior=None):
     comparison is computed here rather than at each of the five exit paths, so
     a path that stops early still states what it compared - the same rule the
     reading block itself follows.
+
+    `priors` is the whole sequence the caller handed in, oldest first. With two
+    or more the wrapper also walks them as a chain, which is the only way a
+    third reading gets a verdict: `reading_compare` still compares this run with
+    the nearest one, and the chain says which neighbouring pair moved. One prior
+    adds no chain key at all, so a payload from a single comparison does not
+    change shape.
     """
     payload = _quiet_days(cache, scan, min_tokens=min_tokens, tolerance=tolerance)
     reading = (payload.get("arbitration") or {}).get("reading") or {}
     payload["reading_compare"] = compare_readings(reading, prior)
+    if priors and len(priors) >= 2:
+        payload["reading_chain"] = reading_chain(priors, reading)
     return payload
 
 
@@ -5895,6 +6179,7 @@ def render_quiet(payload):
             f"                 content {reading['content_digest']} ({reading['content_basis']})"
         )
         lines.extend(_compare_lines(payload.get("reading_compare")))
+        lines.extend(_chain_lines(payload.get("reading_chain")))
     elif reading:
         lines.append(f"    reading      reading not identified -- {reading['reason']}")
     if not payload["available"] or payload["verdict"] in {
@@ -7137,10 +7422,12 @@ def main(argv=None):
     quiet.add_argument(
         "--compare-reading",
         metavar="PATH",
+        action="append",
         default=None,
         help=(
             "a reading saved earlier (a `quiet --json` payload or its reading block) to compare "
-            "this one with; without it this reading stands alone"
+            "this one with; repeat it oldest-first and every neighbouring pair is compared, not "
+            "only the last; without it this reading stands alone"
         ),
     )
     quiet.add_argument(
@@ -7297,15 +7584,21 @@ def main(argv=None):
             print(f"quotamirror: no transcripts at {root}", file=sys.stderr)
             return 2
         scan = scan_usage(root, max_files=args.max_files, manifest=args.manifest)
-        prior = None
-        if args.compare_reading:
+        priors = []
+        for supplied in args.compare_reading or []:
             try:
-                prior = read_prior_reading(args.compare_reading)
+                priors.append(read_prior_reading(supplied))
             except ValueError as exc:
                 print(f"quotamirror: {exc}", file=sys.stderr)
                 return 2
+        prior = priors[-1] if priors else None
         payload = quiet_days(
-            cache, scan, min_tokens=args.min_tokens, tolerance=args.tolerance, prior=prior
+            cache,
+            scan,
+            min_tokens=args.min_tokens,
+            tolerance=args.tolerance,
+            prior=prior,
+            priors=priors,
         )
         payload["source"] = str(Path(args.path).resolve())
         payload["transcript_root"] = str(root.resolve())
