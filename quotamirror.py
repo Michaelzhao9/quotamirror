@@ -5179,7 +5179,141 @@ def _chain_side(row, index, label):
         "records": first("records_parsed", "records"),
         "digest": first("digest", "reading_digest"),
         "content_digest": row.get("content_digest"),
+        "manifest": row.get("manifest"),
+        "manifest_total": row.get("manifest_total"),
+        "manifest_truncated": bool(row.get("manifest_truncated")),
     }
+
+
+_CHAIN_NAME_ROWS = 4
+_CHAIN_NAME_ROOM = 54
+
+
+def _fit_name(name, room=_CHAIN_NAME_ROOM):
+    """Shorten one name for the screen, keeping both ends of it.
+
+    A transcript path can be longer than a line, and the wrap helper cannot
+    break a token without spaces. The end of a manifest name is the file name
+    and the start is the directory, so the middle is what a reader can lose -
+    and losing it is stated on a line of its own rather than left to look like
+    the whole name.
+    """
+    name = str(name)
+    if len(name) <= room:
+        return name
+    head = max(8, room // 2 - 1)
+    tail = max(8, room - head - 1)
+    return name[:head] + "\u2026" + name[-tail:]
+
+_CHAIN_NAMES_LIMIT = (
+    "names are relative to the transcript root, and a rename reads as one name leaving "
+    "while another enters: this follows names, not content"
+)
+
+
+def _chain_names(sides):
+    """Follow each file name across the readings, or refuse to name any.
+
+    The pair rows answer "did the bytes move between 2 and 3". They cannot
+    answer "which file", because a 2000-entry manifest has no place on one
+    line. This walks the same readings by name and reports the step a name
+    first and last appears on - the only part of a chain that a digest cannot
+    carry.
+
+    It refuses in four cases, each with its own sentence: a reading without a
+    manifest (nothing to follow), a truncated manifest (a name could be missing
+    from it and would then look like it left), a manifest whose length
+    contradicts its own file count (a partial list dressed as a whole one), and
+    fewer than two readings carrying names.
+    """
+    block = {
+        "available": False,
+        "verdict": "not_named",
+        "reason": None,
+        "basis": "file name, relative to the transcript root",
+        "limit": _CHAIN_NAMES_LIMIT,
+        "files": [],
+        "throughout": 0,
+        "entered": 0,
+        "left": 0,
+        "blink": 0,
+        "changed": 0,
+        "readings_named": 0,
+    }
+    present = [side for side in sides if side["present"]]
+    named = [side for side in present if side.get("manifest") is not None]
+    block["readings_named"] = len(named)
+    if len(present) < 2:
+        block["reason"] = "fewer than two readings carry a reading, so no name can be followed"
+        return block
+    unnamed = [side["index"] for side in present if side.get("manifest") is None]
+    if unnamed:
+        block["reason"] = (
+            f"reading(s) {', '.join(str(index) for index in unnamed)} carry no file manifest, "
+            "so no name can be followed across this chain (pass --manifest when the reading "
+            "is taken)"
+        )
+        return block
+    truncated = [side["index"] for side in named if side.get("manifest_truncated")]
+    if truncated:
+        block["reason"] = (
+            f"reading(s) {', '.join(str(index) for index in truncated)} hold a truncated "
+            "manifest, so a name missing from it would look like it left"
+        )
+        return block
+    for side in named:
+        held = len(side["manifest"] or [])
+        if side.get("files") is not None and side["files"] != held:
+            block["reason"] = (
+                f"reading {side['index']} counts {side['files']} file(s) but its manifest "
+                f"holds {held}, so the list is not the whole reading"
+            )
+            return block
+
+    indices = [side["index"] for side in present]
+    first_index, last_index = indices[0], indices[-1]
+    seen = {}
+    for side in named:
+        for item in side["manifest"] or []:
+            if not item:
+                continue
+            seen.setdefault(item[0], set()).add(side["index"])
+
+    rows = []
+    for name, steps in sorted(seen.items()):
+        ordered = sorted(steps)
+        span = [index for index in indices if ordered[0] <= index <= ordered[-1]]
+        gap = len(ordered) != len(span)
+        after = [index for index in indices if index > ordered[0]]
+        left_at = next((index for index in after if index not in steps), None)
+        if gap:
+            state = "blink"
+        elif ordered[0] == first_index and ordered[-1] == last_index:
+            state = "throughout"
+        elif ordered[-1] == last_index:
+            state = "entered"
+        elif ordered[0] == first_index:
+            state = "left"
+        else:
+            state = "blink"
+        rows.append(
+            {
+                "name": name,
+                "state": state,
+                "steps": ordered,
+                "entered_at": ordered[0] if ordered[0] != first_index else None,
+                "left_at": left_at if state in {"left", "blink"} else None,
+            }
+        )
+    block["available"] = True
+    block["files"] = rows
+    block["throughout"] = sum(1 for row in rows if row["state"] == "throughout")
+    block["entered"] = sum(1 for row in rows if row["state"] == "entered")
+    block["left"] = sum(1 for row in rows if row["state"] == "left")
+    block["blink"] = sum(1 for row in rows if row["state"] == "blink")
+    block["changed"] = block["entered"] + block["left"] + block["blink"]
+    block["verdict"] = "names_changed" if block["changed"] else "names_stable"
+    return block
 
 
 def _chain_pair(now, prior):
@@ -5259,6 +5393,7 @@ def reading_chain(priors, current):
     sides = [_chain_side(row, index + 1, str(index + 1)) for index, row in enumerate(priors)]
     sides.append(_chain_side(current, len(priors) + 1, "this run"))
     block["readings"] = sides
+    block["names"] = _chain_names(sides)
     if len(priors) < 2:
         block["reason"] = (
             "fewer than two prior readings were handed in, so there is no chain to walk: "
@@ -5420,6 +5555,55 @@ def _chain_lines(chain, width=80):
             f"{chain['contradiction_total']} pair(s) of readings hold the same content digest "
             "but a different count, so they are not counted as a return",
         )
+    names = chain.get("names") or {}
+    if names.get("available"):
+        wrap(
+            "    names        ",
+            f"{len(names['files'])} file name(s) across {names['readings_named']} reading(s): "
+            f"{names['throughout']} in every reading, {names['entered']} entered, "
+            f"{names['left']} left, {names['blink']} blinked",
+        )
+        changed = [item for item in names["files"] if item["state"] != "throughout"]
+        shortened = 0
+        for item in changed[: _CHAIN_NAME_ROWS]:
+            shown = _fit_name(item["name"])
+            if shown != item["name"]:
+                shortened += 1
+            if item["state"] == "entered":
+                if item["entered_at"] == item["steps"][-1]:
+                    text = f"{shown} -- entered on reading {item['entered_at']}, the last reading"
+                else:
+                    text = (
+                        f"{shown} -- entered on reading {item['entered_at']}, "
+                        f"held to reading {item['steps'][-1]}"
+                    )
+            elif item["state"] == "left":
+                text = (
+                    f"{shown} -- last on reading {item['steps'][-1]}, "
+                    f"absent on reading {item['left_at']}"
+                )
+            else:
+                lost = [
+                    index
+                    for index in range(item["steps"][0], item["steps"][-1] + 1)
+                    if index not in item["steps"]
+                ]
+                text = (
+                    f"{shown} -- on reading(s) {', '.join(str(i) for i in item['steps'])}, "
+                    f"absent on {', '.join(str(i) for i in lost)}"
+                )
+            wrap(f"    {item['state']:<13}", " " + text)
+        hidden = len(changed) - _CHAIN_NAME_ROWS
+        if hidden > 0:
+            wrap("    ", f" +{hidden} more name(s) changed; the full list is in --json")
+        if shortened:
+            wrap(
+                "    names full   ",
+                f"{shortened} name(s) shortened to fit; the full name is in --json",
+            )
+        wrap("    names limit  ", names["limit"])
+    elif names:
+        wrap("    names        ", "not named -- " + (names.get("reason") or "no name to follow"))
     return lines
 
 
