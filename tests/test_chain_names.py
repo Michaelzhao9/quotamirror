@@ -292,3 +292,76 @@ def test_no_names_line_is_wider_than_the_screen_when_a_long_name_is_edited():
     )
     for line in quotamirror._chain_lines(chain):
         assert len(line) <= 80, line
+
+
+# --- a rename is one event, not a departure beside an arrival ---------------
+#
+# The pair rows already call identical bytes under two names a move, when the
+# caller kept a --manifest on both readings. The names block did not: it
+# counted the same event as one name that left and another that entered, so a
+# chain could print "bytes_differ" on the pair row and "1 entered, 1 left" a
+# few lines later about one renamed file.
+
+
+def test_a_rename_with_identical_bytes_is_named_as_one_event():
+    chain = quotamirror.reading_chain(
+        [
+            reading_of({"a.jsonl": "1111111111111111"}),
+            reading_of({"old-a.jsonl": "1111111111111111"}),
+        ],
+        reading_of({"old-a.jsonl": "1111111111111111"}),
+    )
+    names = chain["names"]
+    assert names["renamed_total"] == 1
+    assert names["renames"] == [
+        {"from": "a.jsonl", "to": "old-a.jsonl", "step": 2, "size": 10}
+    ]
+    assert row(chain, "a.jsonl")["renamed_to"] == "old-a.jsonl"
+    assert row(chain, "old-a.jsonl")["renamed_from"] == "a.jsonl"
+    assert "renamed a.jsonl -> old-a.jsonl on reading 2" in screen(chain)
+
+
+def test_two_files_that_share_bytes_are_not_paired_into_a_rename():
+    chain = quotamirror.reading_chain(
+        [
+            reading_of({"a1.jsonl": "1111111111111111", "a2.jsonl": "1111111111111111"}),
+            reading_of({"b1.jsonl": "1111111111111111", "b2.jsonl": "1111111111111111"}),
+        ],
+        reading_of({"b1.jsonl": "1111111111111111", "b2.jsonl": "1111111111111111"}),
+    )
+    names = chain["names"]
+    assert names["renamed_total"] == 0
+    assert names["renamed_ambiguous_total"] == 2
+    assert row(chain, "a1.jsonl")["renamed_to"] is None
+    assert "the match is not one-to-one" in screen(chain)
+
+
+def test_a_rename_that_also_edits_its_bytes_is_not_paired():
+    chain = quotamirror.reading_chain(
+        [
+            reading_of({"a.jsonl": "1111111111111111"}),
+            reading_of({"old-a.jsonl": "9999999999999999"}),
+        ],
+        reading_of({"old-a.jsonl": "9999999999999999"}),
+    )
+    names = chain["names"]
+    assert names["renamed_total"] == 0
+    assert names["renamed_ambiguous_total"] == 0
+    assert row(chain, "a.jsonl")["state"] == "left"
+    assert row(chain, "old-a.jsonl")["state"] == "entered"
+    assert "a rename that also edits its bytes" in names["limit"]
+
+
+def test_the_rename_line_is_not_wider_than_the_screen():
+    long_from = "0d6af2d3-4f5f-4283-bb21-bf2baf8be988-transcript-one.jsonl"
+    long_to = "renamed-0d6af2d3-4f5f-4283-bb21-bf2baf8be988-transcript-one.jsonl"
+    chain = quotamirror.reading_chain(
+        [
+            reading_of({long_from: "1111111111111111", "b.jsonl": "2222222222222222"}),
+            reading_of({long_to: "1111111111111111", "b.jsonl": "2222222222222222"}),
+        ],
+        reading_of({long_to: "1111111111111111", "b.jsonl": "2222222222222222"}),
+    )
+    assert chain["names"]["renamed_total"] == 1
+    for line in quotamirror._chain_lines(chain):
+        assert len(line) <= 80, line

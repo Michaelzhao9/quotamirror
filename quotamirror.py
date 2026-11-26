@@ -5206,10 +5206,60 @@ def _fit_name(name, room=_CHAIN_NAME_ROOM):
     return name[:head] + "\u2026" + name[-tail:]
 
 _CHAIN_NAMES_LIMIT = (
-    "names are relative to the transcript root, and content is compared only under a name that "
-    "stayed (the manifest's 16-hex sha256), so a rename plus an edit still reads as one name "
-    "leaving while another enters"
+    "names are relative to the transcript root; content is compared under a name that stayed "
+    "(the manifest's 16-hex sha256) and between a name that left and one that entered when their "
+    "bytes are identical and the match is one-to-one, so a rename that also edits its bytes still "
+    "reads as one name leaving while another enters"
 )
+
+
+def _chain_renames(named, contents):
+    """Pair a name that vanished with one that appeared carrying the same bytes.
+
+    A rename arrives in a chain as one name leaving and another entering on the
+    same step, which is exactly the shape a delete beside a create takes. The
+    manifest already carries size and a content hash per name, so the pair can
+    be forced when the bytes are identical and unique on both sides - the rule
+    `_pair_moves` uses for a single pair of readings. Two names that share bytes
+    are not paired (a guessed subject is worse than a counted one) and are
+    counted as ambiguous instead.
+
+    Only neighbouring readings are compared. A name that skipped a reading may
+    have been renamed in the gap, and nothing here can see that step.
+    """
+    by_index = {side["index"]: side for side in named}
+    order = sorted(by_index)
+    renames = []
+    ambiguous = 0
+    for position in range(len(order) - 1):
+        before, later = order[position], order[position + 1]
+        if later != before + 1:
+            continue
+        prior_names = {item[0] for item in (by_index[before]["manifest"] or []) if item}
+        now_names = {item[0] for item in (by_index[later]["manifest"] or []) if item}
+        # A name with no content hash cannot be matched, and dropping it here
+        # keeps an unhashed file from blocking the pairs that are provable.
+        gone = [name for name in sorted(prior_names - now_names)
+                if contents[name][before][1] is not None]
+        came = [name for name in sorted(now_names - prior_names)
+                if contents[name][later][1] is not None]
+        if not gone or not came:
+            continue
+        prior_index = {
+            name: (contents[name][before][0], 0, contents[name][before][1]) for name in gone
+        }
+        now_index = {
+            name: (contents[name][later][0], 0, contents[name][later][1]) for name in came
+        }
+        moved, _left_added, _left_removed, here = _pair_moves(
+            came, gone, now_index, prior_index
+        )
+        ambiguous += here
+        for pair in moved:
+            renames.append(
+                {"from": pair["from"], "to": pair["to"], "step": later, "size": pair["size"]}
+            )
+    return renames, ambiguous
 
 
 def _chain_names(sides):
@@ -5233,6 +5283,16 @@ def _chain_names(sides):
     bytes changed. A name whose hash is missing on either side of a step is
     counted in `content_unmeasured` and never called edited - an absent hash is
     not a hash that matched.
+
+    Two names can also be one file: a name that vanishes on a step while another
+    appears with the *same* bytes is a rename, and counting it as one departure
+    plus one arrival reports one event twice. The pairing rule is the one the
+    pair row already uses (`_pair_moves`): size and content hash must match and
+    the match must be forced one-to-one. A guessed rename is worse than a
+    counted one, so an ambiguous match is counted and named as ambiguous, and a
+    pairing is only attempted between neighbouring readings that both carry a
+    manifest - a name that skipped a reading could have moved anywhere in the
+    gap.
     """
     block = {
         "available": False,
@@ -5248,6 +5308,9 @@ def _chain_names(sides):
         "changed": 0,
         "edited": 0,
         "content_unmeasured": 0,
+        "renamed_total": 0,
+        "renamed_ambiguous_total": 0,
+        "renames": [],
         "readings_named": 0,
     }
     present = [side for side in sides if side["present"]]
@@ -5284,6 +5347,7 @@ def _chain_names(sides):
     first_index, last_index = indices[0], indices[-1]
     seen = {}
     hashes = {}
+    contents = {}
     for side in named:
         for item in side["manifest"] or []:
             if not item:
@@ -5291,9 +5355,9 @@ def _chain_names(sides):
             name = item[0]
             seen.setdefault(name, set()).add(side["index"])
             digest = item[3] if len(item) > 3 else None
-            hashes.setdefault(name, {})[side["index"]] = (
-                digest.strip() if isinstance(digest, str) and digest.strip() else None
-            )
+            digest = digest.strip() if isinstance(digest, str) and digest.strip() else None
+            hashes.setdefault(name, {})[side["index"]] = digest
+            contents.setdefault(name, {})[side["index"]] = (item[1], digest)
 
     rows = []
     for name, steps in sorted(seen.items()):
@@ -5336,6 +5400,8 @@ def _chain_names(sides):
                 "left_at": left_at if state in {"left", "blink"} else None,
                 "edited_at": edited_at,
                 "content_unmeasured": unmeasured,
+                "renamed_to": None,
+                "renamed_from": None,
             }
         )
     block["available"] = True
@@ -5347,6 +5413,16 @@ def _chain_names(sides):
     block["changed"] = block["entered"] + block["left"] + block["blink"]
     block["edited"] = sum(1 for row in rows if row["edited_at"])
     block["content_unmeasured"] = sum(1 for row in rows if row["content_unmeasured"])
+    renames, ambiguous_renames = _chain_renames(named, contents)
+    by_name = {row["name"]: row for row in rows}
+    for pair in renames:
+        if pair["from"] in by_name:
+            by_name[pair["from"]]["renamed_to"] = pair["to"]
+        if pair["to"] in by_name:
+            by_name[pair["to"]]["renamed_from"] = pair["from"]
+    block["renames"] = renames
+    block["renamed_total"] = len(renames)
+    block["renamed_ambiguous_total"] = ambiguous_renames
     if block["changed"]:
         block["verdict"] = "names_changed"
     elif block["edited"]:
@@ -5610,6 +5686,20 @@ def _chain_lines(chain, width=80):
         if names.get("content_unmeasured"):
             summary += f", {names['content_unmeasured']} with no content hash"
         wrap("    names        ", summary)
+        if names.get("renamed_total"):
+            for pair in names["renames"][: _CHAIN_NAME_ROWS]:
+                wrap(
+                    "    renamed      ",
+                    f" {_fit_name(pair['from'], 24)} -> {_fit_name(pair['to'], 24)} on reading "
+                    f"{pair['step']}, same size and content hash -- the name that left and the "
+                    "one that entered are this one file",
+                )
+        if names.get("renamed_ambiguous_total"):
+            wrap(
+                "    renamed      ",
+                f"{names['renamed_ambiguous_total']} name(s) left while another entered with the "
+                "same bytes on one step, but the match is not one-to-one, so no rename is named",
+            )
         changed = [
             item
             for item in names["files"]
