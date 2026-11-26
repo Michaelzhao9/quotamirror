@@ -159,3 +159,33 @@ def test_a_short_day_is_json_serialisable_and_named_as_a_string(tmp_path):
     witness = witness_of(result)
     assert witness["worst_day"] == "2026-05-04"
     json.dumps(result, indent=2, sort_keys=True)
+
+
+def test_witness_payload_counts_the_days_below_the_floor(tmp_path):
+    # On the real receipt the witness axis holds 36 of the 38 billed days: the
+    # two sub-floor days leave its total short of the in-window figure printed
+    # three lines above it, and nothing said so.
+    scan = scan_of(tmp_path, [usage_line("m1", "2026-05-04T10:00:00Z", 1000)])
+    cache = cache_with([("2026-05-04", 1000), ("2026-05-05", 5)])
+    result = quotamirror.quiet_days(cache, scan, min_tokens=1000)
+    witness = witness_of(result)
+    assert witness["receipt_total"] == 1000
+    assert witness["days_below_floor"] == 1
+    assert witness["tokens_below_floor"] == 5
+
+
+def test_witness_text_names_the_floor_when_a_day_sits_below_it(tmp_path):
+    scan = scan_of(tmp_path, [usage_line("m1", "2026-05-04T10:00:00Z", 1000)])
+    cache = cache_with([("2026-05-04", 1000), ("2026-05-05", 5)])
+    payload = quotamirror.quiet_days(cache, scan, min_tokens=1000)
+    text = " ".join(quotamirror.render_quiet(payload).split())
+    assert "above the 1,000-token floor" in text
+    assert "1 day(s) holding 5 token(s) are below it" in text
+
+
+def test_witness_text_stays_quiet_when_no_day_is_below_the_floor(tmp_path):
+    scan = scan_of(tmp_path, [usage_line("m1", "2026-05-04T10:00:00Z", 1000)])
+    cache = cache_with([("2026-05-04", 1000)])
+    payload = quotamirror.quiet_days(cache, scan, min_tokens=1000)
+    text = " ".join(quotamirror.render_quiet(payload).split())
+    assert "floor" not in text

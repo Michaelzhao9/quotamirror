@@ -5806,6 +5806,12 @@ def _witness_axis(billed_days, record_sum, floor, tol, unmeasured=()):
             "unmeasured": 0,
         },
         "tokens": {"exact": 0, "remnant": 0, "absent": 0, "over": 0},
+        # Days the floor keeps out of this axis. They are not evidence holes -
+        # they are simply too small to weigh - but leaving them uncounted made
+        # `receipt_total` a different number from the bill printed above it.
+        "min_tokens": floor,
+        "days_below_floor": 0,
+        "tokens_below_floor": 0,
         "receipt_total": 0,
         "record_sum_total": 0,
         "residual_tokens": 0,
@@ -5821,6 +5827,13 @@ def _witness_axis(billed_days, record_sum, floor, tol, unmeasured=()):
     rows, receipt_total = _witness_rows(
         billed_days, record_sum, floor, tol, unmeasured
     )
+    below = [
+        int(tokens)
+        for tokens in (billed_days or {}).values()
+        if tokens and int(tokens) < floor
+    ]
+    block["days_below_floor"] = len(below)
+    block["tokens_below_floor"] = sum(below)
     if not rows:
         block["reason"] = (
             f"no billed day reaches the {floor:,}-token floor, so no day's evidence can be "
@@ -6676,7 +6689,15 @@ def render_quiet(payload):
             line = (
                 f"    witness      {' | '.join(day_parts)} -- checked "
                 f"{witness['checked_share']:.1%} of {_fmt(witness['receipt_total'])} billed "
-                f"tokens; {witness['verdict'].replace('_', ' ')}"
+                "tokens"
+                + (
+                    f" above the {witness['min_tokens']:,}-token floor "
+                    f"({witness['days_below_floor']} day(s) holding "
+                    f"{_fmt(witness['tokens_below_floor'])} token(s) are below it)"
+                    if witness.get("days_below_floor")
+                    else ""
+                )
+                + f"; {witness['verdict'].replace('_', ' ')}"
             )
             if witness.get("worst_day"):
                 line += (

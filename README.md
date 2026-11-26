@@ -348,6 +348,16 @@ reached is exactly the `absent` case, and intersecting first would drop those da
 the one place in this command that can say the ratio is arithmetic on a lossy denominator —
 `checked_share` is that share — and it still names no cause for the missing records.
 
+**The witness total says which days it leaves out.** A floor keeps small days out of the axis,
+so `N` above is not always the number printed in the header. Synthetic shapes illustrate it: a
+header stating 2,400,000 tokens on 4 days in the window beside a witness axis weighing
+2,350,000 on 3 — the 50,000 difference sits on one sub-floor day, and before 0.56.0 nothing
+said so. The sentence now names its own denominator — `above the 1,000,000-token floor
+(1 day(s) holding 50,000 token(s) are below it)` — and the payload carries `min_tokens`,
+`days_below_floor` and `tokens_below_floor`, so the two totals on one screen reconcile by
+addition. When no day sits below the floor the phrase is absent, because then the witness
+total *is* the header's bill and there is nothing to reconcile.
+
 **On a witnessed day, repeats can be counted instead of guessed.** A day being `exact` is what
 earns the right to compare the record sum with the deduped total: on that day the record set is
 demonstrably complete, so the difference cannot be records that went missing — it is the same
