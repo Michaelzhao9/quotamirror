@@ -158,3 +158,24 @@ def test_disjoint_spans_still_name_the_tail_they_cannot_judge(tmp_path):
 
     text = quotamirror.render_quiet(result)
     assert "1 day(s)" in row_of(text, "tail")
+
+
+def test_the_outside_count_says_it_already_holds_the_tail(tmp_path):
+    # Two overlapping counts on one screen invite an addition, so the union
+    # line says which part of itself is already named two lines above.
+    scan = receipts_written_on_05_04(tmp_path)
+    result = quotamirror.quiet_days(cache_with([("2026-05-04", 400)]), scan)
+
+    assert result["days_outside_window"] == 2
+
+    outside = row_of(quotamirror.render_quiet(result), "outside")
+    assert "2 day(s)" in outside
+    assert "including the 2 tail day(s) named above" in outside
+
+
+def test_the_outside_count_stays_a_plain_union_without_a_tail(tmp_path):
+    scan = scan_of(tmp_path, {"a.jsonl": [usage_line("m1", "2026-05-04T10:00:00Z", 100)]})
+    result = quotamirror.quiet_days(cache_with([("2026-05-04", 400), ("2026-05-09", 400)]), scan)
+
+    outside = row_of(quotamirror.render_quiet(result), "outside")
+    assert "including" not in outside

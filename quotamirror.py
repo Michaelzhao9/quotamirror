@@ -6686,7 +6686,7 @@ def render_quiet(payload):
         )
     else:
         lines.append("  window      none -- the two stores share no day")
-    if payload["days_after_receipt"]:
+    if payload.get("days_after_receipt"):
         span = _range(*payload["transcript_tail"])
         lines.append(
             f"  tail        {payload['days_after_receipt']} day(s) after the receipt's "
@@ -6900,10 +6900,17 @@ def render_quiet(payload):
                     )
 
     lines.append(f"  meter check: {block.get('verdict')} -- {block.get('reason')}")
-    lines.append(
+    outside_row = (
         f"  outside     {payload['days_outside_window']} day(s) are reached by only one store "
         "- not judged here"
     )
+    if payload.get("days_after_receipt"):
+        # The union above already holds the tail days. Two overlapping counts
+        # on one screen invite an addition, so the union says what it includes.
+        outside_row += (
+            f", including the {payload['days_after_receipt']} tail day(s) named above"
+        )
+    lines.append(outside_row)
     gaps = [row for row in payload["rows"] if row["kind"] != "silent"]
     if gaps:
         lines.append("")
