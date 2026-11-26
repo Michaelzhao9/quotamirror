@@ -4831,11 +4831,11 @@ def _prior_manifest(doc):
     total = doc.get("manifest_total")
     truncated = doc.get("manifest_truncated")
     try:
-        total = int(total) if total is not None else 0
+        total = int(total) if total is not None else None
     except (TypeError, ValueError):
-        total = 0
+        total = None
     if raw is None:
-        return None, total, bool(truncated)
+        return None, total or 0, bool(truncated)
     if not isinstance(raw, list):
         raise ValueError("--compare-reading holds a manifest that is not a list of files")
     entries = []
@@ -4854,7 +4854,7 @@ def _prior_manifest(doc):
             raise ValueError(
                 f"--compare-reading holds a manifest entry with a non-numeric size or mtime: {name}"
             ) from None
-    return entries, total or len(entries), bool(truncated)
+    return entries, total, bool(truncated)
 
 
 def read_prior_reading(path):
@@ -4967,7 +4967,14 @@ def _name_changes(current, prior):
         return attribution
     for label, side in (("this run", current), ("the supplied reading", prior)):
         entries = side.get("manifest") or []
-        total = side.get("manifest_total") or len(entries)
+        total = side.get("manifest_total")
+        if total is None:
+            attribution["reason"] = (
+                f"{label} does not say how many files it read (no file total), so its "
+                "manifest cannot be shown to be the whole corpus; re-take it with a "
+                "version that records the total"
+            )
+            return attribution
         if total != len(entries):
             attribution["reason"] = (
                 f"{label} holds {len(entries)} of {total} file(s) in its manifest, so a "
@@ -5336,6 +5343,19 @@ def _chain_names(sides):
         return block
     for side in named:
         held = len(side["manifest"] or [])
+        total = side.get("manifest_total")
+        if total is None:
+            block["reason"] = (
+                f"reading {side['index']} does not say how many files it read (no file "
+                "total), so its manifest cannot be shown to be the whole reading"
+            )
+            return block
+        if total != held:
+            block["reason"] = (
+                f"reading {side['index']} says it read {total} file(s) but its manifest "
+                f"holds {held}, so the list is not the whole reading"
+            )
+            return block
         if side.get("files") is not None and side["files"] != held:
             block["reason"] = (
                 f"reading {side['index']} counts {side['files']} file(s) but its manifest "
