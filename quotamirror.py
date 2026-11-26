@@ -6091,6 +6091,32 @@ def quiet_days(cache, scan, min_tokens=None, tolerance=None, prior=None, priors=
     return payload
 
 
+def _billed_reason(days, tokens, inside, span):
+    """What a billed day the transcripts miss can honestly be said to be.
+
+    `inside` is how many of those `days` fall between the first and the last
+    day the transcripts reach. The window this command judges is the
+    intersection of the two spans, so on this code path that count is all of
+    them; the split is still computed and named, because a sentence about the
+    edge of a corpus has to be paid for by the corpus, not assumed.
+    """
+    head = (
+        f"{days} day(s) carry {tokens:,} token(s) in the receipt's own day table while the "
+        "transcripts hold no token record for them"
+    )
+    tail = "the transcript total inside the window is a floor, not a measurement of it"
+    if inside == days:
+        return (
+            f"{head}: all {days} lie inside the transcript span {span[0]}..{span[1]}, so the "
+            "corpus reaches those dates and holds nothing for them - a hole inside the span, "
+            f"not the edge of it; {tail}"
+        )
+    return (
+        f"{head}: {inside} of {days} lie inside the transcript span {span[0]}..{span[1]} and "
+        f"{days - inside} fall outside it; {tail}"
+    )
+
+
 def _quiet_days(cache, scan, min_tokens=None, tolerance=None):
     """Name the days each of two independent stores is silent on.
 
@@ -6106,9 +6132,12 @@ def _quiet_days(cache, scan, min_tokens=None, tolerance=None):
 
     * both sides count something -> the day is measured;
     * the receipt's token table bills the day while the transcripts hold no
-      token record -> the receipt states the number and the transcript corpus
-      does not reach that day. Those tokens are counted separately and never
-      added to the transcript side, and the day's own number is printed;
+      token record -> the receipt states the number and the transcripts hold
+      nothing for that day. The window is the two spans' intersection, so such
+      a day lies *inside* the corpus and the gap is a hole in its records, not
+      the edge of it, and the verdict says which of the two it is. Those tokens
+      are counted separately and never added to the transcript side, and the
+      day's own number is printed;
     * the receipt counts messages but neither token table states a number for
       the day -> the day is *not* quiet, but no store can say what it cost;
     * the transcripts hold tokens while the receipt has no activity row -> the
@@ -6362,12 +6391,24 @@ def _quiet_days(cache, scan, min_tokens=None, tolerance=None):
     )
 
     if payload["days_receipt_billed"]:
+        # Every day in this window lies between the first and the last day the
+        # transcripts reach, because the window is their intersection. So the
+        # count below is the evidence for the sentence: if all of the billed
+        # days fall inside the span, the corpus reaches their dates and holds
+        # nothing for them, which is a hole inside the span and not its edge.
+        inside = sum(
+            1
+            for row in rows
+            if row["kind"] == "receipt_billed"
+            and transcript_start <= _day_of(row["date"]) <= transcript_end
+        )
         payload["verdict"] = "billed_without_transcripts"
-        payload["reason"] = (
-            f"{payload['days_receipt_billed']} day(s) carry {payload['receipt_tokens_billed']:,} "
-            "token(s) in the receipt's own day table while the transcripts hold no record for "
-            "them: the transcript corpus does not reach those days, so its total inside the "
-            "window is a floor and not a measurement of the window"
+        payload["receipt_billed_days_inside_span"] = inside
+        payload["reason"] = _billed_reason(
+            payload["days_receipt_billed"],
+            payload["receipt_tokens_billed"],
+            inside,
+            (transcript_start, transcript_end),
         )
     elif payload["days_activity_only"]:
         payload["verdict"] = "activity_without_tokens"

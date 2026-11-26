@@ -286,6 +286,15 @@ into the transcript side; the verdict is `billed_without_transcripts`, because a
 total inside such a window is a floor and not a measurement of it. A row that sums to zero, and
 a receipt with no such table, do not upgrade a day: a zero states nothing.
 
+**The verdict does not blame an edge it has not measured.** The window judged here is the
+intersection of the two spans, so a day it reports on always lies between the first and the
+last day the transcripts reach. Until 0.57.0 the reason sentence still said the corpus "does
+not reach those days" — a cause contradicted by the `transcripts` span printed above it, since
+the days it named sat inside that span. The sentence now counts the billed days that fall
+inside the span (`receipt_billed_days_inside_span`) and says what the count supports: all of
+them inside, the corpus reaches those dates and holds nothing for them, a hole inside the span
+and not its edge; any of them outside, it prints the split instead of the claim.
+
 **Two totals printed side by side invite a subtraction, so the difference is measured.** The
 transcript corpus can differ from the receipt in one mechanical way a reader can check: a
 streamed response may write its usage record more than once, so the same days hold a *record
