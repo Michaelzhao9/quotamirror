@@ -365,3 +365,42 @@ def test_the_rename_line_is_not_wider_than_the_screen():
     assert chain["names"]["renamed_total"] == 1
     for line in quotamirror._chain_lines(chain):
         assert len(line) <= 80, line
+
+
+# --- the two rows a rename leaves behind have to point at each other --------
+#
+# The renamed line says the pair is one file, but the `left` and `entered` rows
+# below it still read as two unrelated names: a reader who stops at those rows
+# sees a departure and an arrival, which is exactly the reading the renamed
+# line exists to prevent. The rows already carry renamed_to / renamed_from in
+# the payload; this is only the screen catching up with it.
+
+
+def test_the_rows_behind_a_rename_name_each_other():
+    chain = quotamirror.reading_chain(
+        [
+            reading_of({"a.jsonl": "1111111111111111", "b.jsonl": "2222222222222222"}),
+            reading_of({"old-a.jsonl": "1111111111111111", "b.jsonl": "2222222222222222"}),
+        ],
+        reading_of({"old-a.jsonl": "1111111111111111", "b.jsonl": "2222222222222222"}),
+    )
+    text = screen(chain)
+    assert "absent on reading 2, so this file is now named old-a.jsonl" in text
+    assert "entered on reading 2, held to reading 3, renamed from a.jsonl" in text
+
+
+def test_the_cross_reference_survives_two_long_names():
+    long_from = "0d6af2d3-4f5f-4283-bb21-bf2baf8be988-transcript-one.jsonl"
+    long_to = "renamed-0d6af2d3-4f5f-4283-bb21-bf2baf8be988-transcript-one.jsonl"
+    chain = quotamirror.reading_chain(
+        [
+            reading_of({long_from: "1111111111111111", "b.jsonl": "2222222222222222"}),
+            reading_of({long_to: "1111111111111111", "b.jsonl": "2222222222222222"}),
+        ],
+        reading_of({long_to: "1111111111111111", "b.jsonl": "2222222222222222"}),
+    )
+    text = screen(chain)
+    assert "so this file is now named" in text
+    assert "renamed from" in text
+    for line in quotamirror._chain_lines(chain):
+        assert len(line) <= 80, line

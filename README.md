@@ -657,8 +657,12 @@ The suite covers receipt reconciliation, unit and cumulative checks, loop dedupl
                  3, same size and content hash -- the name that left and the
                  one that entered are this one file
     left          0d6af2d3-…-8be988.jsonl -- last on reading 2, absent on
-                 reading 3
+                 reading 3, so this file is now named renamed-0d6a.jsonl
+    entered       renamed-0d6a.jsonl -- entered on reading 3, the last
+                 reading, renamed from 0d6af2d3-…-8be988.jsonl
 ```
+
+The two rows a rename leaves behind name each other in the same words the renamed line uses: read alone, `left` beside `entered` is exactly the departure-plus-arrival reading the renamed line exists to prevent, and a reader who stops at those rows would take it. Both sentences come from `renamed_to`/`renamed_from` already in `--json`, so the screen and the payload cannot disagree about which two names are one file.
 
 Where a name *stayed*, though, the name is its own identity, so the manifest's content hash is compared step by step: a file edited in place is named with the step its bytes changed (`edited_at`), the summary line counts it (`N edited in place`), and a chain whose names all held while bytes moved answers `names_held_content_moved` instead of `names_stable`, which would be an all-clear printed beside a pair row that found different bytes. A name whose hash is missing on either side of a step is counted in `content_unmeasured` and never called edited — an absent hash is not a hash that matched. The names are relative to the transcript root, as the manifest already is.
 

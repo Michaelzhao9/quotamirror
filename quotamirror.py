@@ -5728,11 +5728,18 @@ def _chain_lines(chain, width=80):
                         f"{shown} -- entered on reading {item['entered_at']}, "
                         f"held to reading {item['steps'][-1]}"
                     )
+                if item.get("renamed_from"):
+                    # Without this the row reads as an arrival beside the
+                    # `left` row's departure, which is the one reading the
+                    # renamed line above already refused.
+                    text += f", renamed from {_fit_name(item['renamed_from'])}"
             elif item["state"] == "left":
                 text = (
                     f"{shown} -- last on reading {item['steps'][-1]}, "
                     f"absent on reading {item['left_at']}"
                 )
+                if item.get("renamed_to"):
+                    text += f", so this file is now named {_fit_name(item['renamed_to'])}"
             elif item["state"] == "blink":
                 lost = [
                     index
