@@ -295,6 +295,26 @@ inside the span (`receipt_billed_days_inside_span`) and says what the count supp
 them inside, the corpus reaches those dates and holds nothing for them, a hole inside the span
 and not its edge; any of them outside, it prints the split instead of the claim.
 
+**A window that ends before the corpus does says where it ends.** The window is the
+intersection of the two spans, so a transcript day *after* the receipt's last stated day is
+judged by nothing. On a real machine whose cache stopped a month before the transcripts did,
+that left a month of activity off the end of the window with no line of the screen saying so:
+the two spans above it were the only evidence, and a reader who saw a large silent count had
+no reason to compare them. 0.60.0 counts those days, names their span and their token total,
+and says the window ends before them:
+
+```
+  window      2026-05-03 .. 2026-05-25 (23 day(s))
+  tail        2 day(s) after the receipt's last day (2026-05-28 .. 2026-05-31,
+              1,200 token(s)), not judged: the window ends there
+```
+
+`days_after_receipt`, `transcript_tail` and `transcript_tail_tokens` carry the same three
+facts in `--json`. They are not added to `days_in_window` and do not enter any verdict: the
+receipt states nothing about those days, so nothing about them is claimed — they are outside
+what this comparison can see. A cache that stopped a month early is exactly what a window
+with no end noted looks like, and this tool exists to stop that reading.
+
 **Two totals printed side by side invite a subtraction, so the difference is measured.** The
 transcript corpus can differ from the receipt in one mechanical way a reader can check: a
 streamed response may write its usage record more than once, so the same days hold a *record

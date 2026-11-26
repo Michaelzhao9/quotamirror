@@ -6324,6 +6324,9 @@ def _quiet_days(cache, scan, min_tokens=None, tolerance=None):
         "days_tokens_only": 0,
         "days_silent": 0,
         "days_outside_window": 0,
+        "days_after_receipt": 0,
+        "transcript_tail": None,
+        "transcript_tail_tokens": 0,
         "measured_messages": 0,
         "measured_tokens": 0,
         "receipt_tokens_billed": 0,
@@ -6389,6 +6392,17 @@ def _quiet_days(cache, scan, min_tokens=None, tolerance=None):
     payload["available"] = True
     transcript_start, transcript_end = min(transcript_days), max(transcript_days)
     payload["transcript_span"] = [str(transcript_start), str(transcript_end)]
+
+    # The window is the intersection, so any day the transcripts record after
+    # the receipt's last stated day falls off its end and is judged by nothing.
+    # Counted and named here rather than folded into the window: the receipt
+    # makes no claim about those days, and a window that silently stopped a
+    # month before the corpus did is how a stale cache reads as a healthy one.
+    tail_days = sorted(day for day in transcript_days if day > receipt_end)
+    if tail_days:
+        payload["days_after_receipt"] = len(tail_days)
+        payload["transcript_tail"] = [str(tail_days[0]), str(tail_days[-1])]
+        payload["transcript_tail_tokens"] = sum(transcript_days[day] for day in tail_days)
 
     start = max(receipt_start, transcript_start)
     end = min(receipt_end, transcript_end)
@@ -6672,6 +6686,16 @@ def render_quiet(payload):
         )
     else:
         lines.append("  window      none -- the two stores share no day")
+    if payload["days_after_receipt"]:
+        span = _range(*payload["transcript_tail"])
+        lines.append(
+            f"  tail        {payload['days_after_receipt']} day(s) after the receipt's "
+            f"last day ({span},"
+        )
+        lines.append(
+            f"              {_fmt(payload['transcript_tail_tokens'])} token(s)), "
+            "not judged: the window ends there"
+        )
     lines.append("")
     # Printed on every path, including the ones that stop before any day is
     # judged: a verdict's claim about a corpus is only readable if the corpus
