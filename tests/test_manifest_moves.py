@@ -106,7 +106,9 @@ def test_a_renamed_file_is_named_as_a_move_not_as_added_and_removed(tmp_path):
     attribution = block["attribution"]
     assert attribution["available"] is True
     assert attribution["moved_total"] == 1
-    assert attribution["moved"] == [{"from": "b.jsonl", "to": "c.jsonl", "size": size}]
+    assert attribution["moved"] == [
+        {"from": "b.jsonl", "to": "c.jsonl", "size": size, "size_from": size, "grown": False}
+    ]
     assert attribution["added"] == []
     assert attribution["removed"] == []
     assert attribution["moved_ambiguous_total"] == 0

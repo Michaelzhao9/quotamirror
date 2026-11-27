@@ -4106,6 +4106,24 @@ def _content_hash(path, chunk=1 << 20):
     return digest.hexdigest()[:16]
 
 
+HEAD_PREFIX_BYTES = 4096
+
+
+def _head_hash(path, limit=HEAD_PREFIX_BYTES):
+    """sha256[:16] of a file's first `limit` bytes - the part an append leaves alone.
+
+    A whole-file hash cannot tell a rename from a rename plus an append, and a
+    rename that also writes bytes is the common case for a transcript that is
+    still being written. The prefix survives an append (and a truncation keeps
+    it too), so two names that share it are one file even when sizes differ.
+    A file shorter than `limit` has head == whole-file hash, so an edit to it
+    stays indistinguishable from a delete beside a create - a limit, stated on
+    screen, not papered over with a heuristic.
+    """
+    with open(path, "rb") as handle:
+        return hashlib.sha256(handle.read(int(limit))).hexdigest()[:16]
+
+
 def scan_usage(root, max_files=None, manifest=False):
     """Read the Claude transcript corpus once: one merge rule, one set of counts.
 
@@ -4153,7 +4171,15 @@ def scan_usage(root, max_files=None, manifest=False):
         inventory_parts.append(f"{label}|{file_stat.st_size}|{file_stat.st_mtime_ns}")
         content_parts.append(f"{label}|{content_hash}")
         if manifest:
-            file_facts.append((label, file_stat.st_size, file_stat.st_mtime_ns, content_hash))
+            file_facts.append(
+                (
+                    label,
+                    file_stat.st_size,
+                    file_stat.st_mtime_ns,
+                    content_hash,
+                    _head_hash(path),
+                )
+            )
         with handle:
             for line in handle:
                 if '"usage"' not in line:
@@ -4977,7 +5003,10 @@ def _prior_manifest(doc):
     so it is also the only part that can arrive malformed. Entries are
     `[name, size, mtime_ns, content_hash]` - the exact tuple the scan built -
     and a wrong shape is refused here rather than skipped at comparison time,
-    because a silently dropped entry would make a changed file invisible.
+    because a silently dropped entry would make a changed file invisible. A
+    fifth element (the head hash, added in 0.65.0) is optional: a reading taken
+    by an older version simply carries no head, and pairing falls back to the
+    whole-file rule rather than calling the manifest malformed.
     """
     raw = doc.get("manifest")
     total = doc.get("manifest_total")
@@ -4992,20 +5021,28 @@ def _prior_manifest(doc):
         raise ValueError("--compare-reading holds a manifest that is not a list of files")
     entries = []
     for item in raw:
-        if not isinstance(item, (list, tuple)) or len(item) != 4:
+        if not isinstance(item, (list, tuple)) or len(item) not in (4, 5):
             raise ValueError(
                 "--compare-reading holds a manifest entry that is not "
                 "[name, size, mtime_ns, content_hash]"
             )
-        name, size, mtime_ns, digest = item
+        name, size, mtime_ns, digest = item[:4]
         if not isinstance(name, str) or not name:
             raise ValueError("--compare-reading holds a manifest entry without a name")
         try:
-            entries.append((name, int(size), int(mtime_ns), str(digest)))
+            row = (name, int(size), int(mtime_ns), str(digest))
         except (TypeError, ValueError):
             raise ValueError(
                 f"--compare-reading holds a manifest entry with a non-numeric size or mtime: {name}"
             ) from None
+        if len(item) == 5:
+            head = item[4]
+            if head is not None and not isinstance(head, str):
+                raise ValueError(
+                    f"--compare-reading holds a manifest entry whose head hash is not text: {name}"
+                )
+            row = (*row, head)
+        entries.append(row)
     return entries, total, bool(truncated)
 
 
@@ -5023,22 +5060,37 @@ def read_prior_reading(path):
 
 
 def _manifest_index(entries):
-    return {name: (size, mtime_ns, digest) for name, size, mtime_ns, digest in entries}
+    """Index a manifest by name, tolerating an entry that carries no head hash."""
+    index = {}
+    for entry in entries:
+        name, size, mtime_ns, digest = entry[:4]
+        head = entry[4] if len(entry) > 4 else None
+        if isinstance(head, str):
+            head = head.strip() or None
+        index[name] = {"size": size, "mtime": mtime_ns, "digest": digest, "head": head}
+    return index
 
 
 def _pair_moves(added, removed, now_index, prior_index):
-    """Pair a vanished name with a new one that carries the same bytes.
+    """Pair a vanished name with a new one that is the same file.
 
     A rename arrives as one `added` plus one `removed` - the same shape an add
     beside a delete takes. Size and content hash are already in the manifest,
     so the pair can be named as a move, but only when the pairing is forced:
     two files with identical content on either side make every pairing a guess,
     and a guessed subject is worse than a counted one.
+
+    A rename that also wrote bytes matches neither size nor whole-file hash.
+    The manifest's head hash (first 4 KiB) is the axis that survives an append,
+    so a second pass pairs what the first left over when exactly one name on
+    each side carries the same head. Those rows say `grown` and carry both
+    sizes; a file shorter than the prefix has head == its whole-file hash and
+    is therefore not paired this way - a limit, not a silent success.
     """
 
     def content_of(name, index):
-        size, _mtime, digest = index[name]
-        return (size, digest)
+        row = index[name]
+        return (row["size"], row["digest"])
 
     by_added = {}
     for name in added:
@@ -5050,21 +5102,67 @@ def _pair_moves(added, removed, now_index, prior_index):
     moved = []
     paired_added = set()
     paired_removed = set()
-    ambiguous = 0
+    ambiguous_names = set()
     for content, new_names in by_added.items():
         old_names = by_removed.get(content) or []
         if not old_names:
             continue
         if len(new_names) == 1 and len(old_names) == 1:
-            moved.append({"from": old_names[0], "to": new_names[0], "size": content[0]})
+            moved.append(
+                {
+                    "from": old_names[0],
+                    "to": new_names[0],
+                    "size": content[0],
+                    "size_from": content[0],
+                    "grown": False,
+                }
+            )
             paired_added.add(new_names[0])
             paired_removed.add(old_names[0])
         else:
-            ambiguous += len(new_names)
+            ambiguous_names.update(new_names)
+
+    grown = 0
+    left_added = [name for name in added if name not in paired_added]
+    left_removed = [name for name in removed if name not in paired_removed]
+    by_head_added = {}
+    for name in left_added:
+        head = now_index[name].get("head")
+        if head:
+            by_head_added.setdefault(head, []).append(name)
+    by_head_removed = {}
+    for name in left_removed:
+        head = prior_index[name].get("head")
+        if head:
+            by_head_removed.setdefault(head, []).append(name)
+    for head, new_names in by_head_added.items():
+        old_names = by_head_removed.get(head) or []
+        if not old_names:
+            continue
+        if len(new_names) == 1 and len(old_names) == 1:
+            pairs = (new_names[0], old_names[0])
+            moved.append(
+                {
+                    "from": pairs[1],
+                    "to": pairs[0],
+                    "size": now_index[pairs[0]]["size"],
+                    "size_from": prior_index[pairs[1]]["size"],
+                    "grown": True,
+                }
+            )
+            paired_added.add(pairs[0])
+            paired_removed.add(pairs[1])
+            grown += 1
+        else:
+            # A name already counted as ambiguous by the exact pass is not
+            # counted again here: one file that cannot be paired is unpaired
+            # once, whichever axis failed to match it.
+            ambiguous_names.update(new_names)
+
     moved.sort(key=lambda row: row["from"])
     left_added = [name for name in added if name not in paired_added]
     left_removed = [name for name in removed if name not in paired_removed]
-    return moved, left_added, left_removed, ambiguous
+    return moved, left_added, left_removed, len(ambiguous_names), grown
 
 
 def _name_changes(current, prior):
@@ -5089,6 +5187,7 @@ def _name_changes(current, prior):
         "removed_total": 0,
         "moved": [],
         "moved_total": 0,
+        "moved_grown_total": 0,
         "moved_ambiguous_total": 0,
     }
     now_manifest = (current or {}).get("manifest")
@@ -5145,11 +5244,10 @@ def _name_changes(current, prior):
     mtime_only = []
     content_changed = []
     for name in sorted(set(now_index) & set(prior_index)):
-        now_size, now_mtime, now_hash = now_index[name]
-        prior_size, prior_mtime, prior_hash = prior_index[name]
-        if now_hash != prior_hash:
+        now_row, prior_row = now_index[name], prior_index[name]
+        if now_row["digest"] != prior_row["digest"]:
             content_changed.append(name)
-        elif (now_size, now_mtime) != (prior_size, prior_mtime):
+        elif (now_row["size"], now_row["mtime"]) != (prior_row["size"], prior_row["mtime"]):
             mtime_only.append(name)
     added = sorted(set(now_index) - set(prior_index))
     removed = sorted(set(prior_index) - set(now_index))
@@ -5162,9 +5260,12 @@ def _name_changes(current, prior):
         )
         return attribution
     attribution["available"] = True
-    moved, added, removed, ambiguous = _pair_moves(added, removed, now_index, prior_index)
+    moved, added, removed, ambiguous, grown = _pair_moves(
+        added, removed, now_index, prior_index
+    )
     attribution["moved"] = moved[:ATTRIBUTION_LIMIT]
     attribution["moved_total"] = len(moved)
+    attribution["moved_grown_total"] = grown
     attribution["moved_ambiguous_total"] = ambiguous
     attribution["mtime_only"] = mtime_only[:ATTRIBUTION_LIMIT]
     attribution["mtime_only_total"] = len(mtime_only)
@@ -5367,8 +5468,9 @@ def _fit_name(name, room=_CHAIN_NAME_ROOM):
 _CHAIN_NAMES_LIMIT = (
     "names are relative to the transcript root; content is compared under a name that stayed "
     "(the manifest's 16-hex sha256) and between a name that left and one that entered when their "
-    "bytes are identical and the match is one-to-one, so a rename that also edits its bytes still "
-    "reads as one name leaving while another enters"
+    "bytes are identical and the match is one-to-one, or when their first 4 KiB match (a rename "
+    "that appended); a rename that also rewrites bytes inside that first 4 KiB - and any file "
+    "shorter than it - still reads as one name leaving while another enters"
 )
 
 
@@ -5405,18 +5507,37 @@ def _chain_renames(named, contents):
         if not gone or not came:
             continue
         prior_index = {
-            name: (contents[name][before][0], 0, contents[name][before][1]) for name in gone
+            name: {
+                "size": contents[name][before][0],
+                "mtime": 0,
+                "digest": contents[name][before][1],
+                "head": contents[name][before][2],
+            }
+            for name in gone
         }
         now_index = {
-            name: (contents[name][later][0], 0, contents[name][later][1]) for name in came
+            name: {
+                "size": contents[name][later][0],
+                "mtime": 0,
+                "digest": contents[name][later][1],
+                "head": contents[name][later][2],
+            }
+            for name in came
         }
-        moved, _left_added, _left_removed, here = _pair_moves(
+        moved, _left_added, _left_removed, here, _grown = _pair_moves(
             came, gone, now_index, prior_index
         )
         ambiguous += here
         for pair in moved:
             renames.append(
-                {"from": pair["from"], "to": pair["to"], "step": later, "size": pair["size"]}
+                {
+                    "from": pair["from"],
+                    "to": pair["to"],
+                    "step": later,
+                    "size": pair["size"],
+                    "size_before": pair["size_from"],
+                    "grown": bool(pair.get("grown")),
+                }
             )
     return renames, ambiguous
 
@@ -5468,6 +5589,7 @@ def _chain_names(sides):
         "edited": 0,
         "content_unmeasured": 0,
         "renamed_total": 0,
+        "renamed_grown_total": 0,
         "renamed_ambiguous_total": 0,
         "renames": [],
         "readings_named": 0,
@@ -5528,8 +5650,10 @@ def _chain_names(sides):
             seen.setdefault(name, set()).add(side["index"])
             digest = item[3] if len(item) > 3 else None
             digest = digest.strip() if isinstance(digest, str) and digest.strip() else None
+            head = item[4] if len(item) > 4 else None
+            head = head.strip() if isinstance(head, str) and head.strip() else None
             hashes.setdefault(name, {})[side["index"]] = digest
-            contents.setdefault(name, {})[side["index"]] = (item[1], digest)
+            contents.setdefault(name, {})[side["index"]] = (item[1], digest, head)
 
     rows = []
     for name, steps in sorted(seen.items()):
@@ -5594,6 +5718,7 @@ def _chain_names(sides):
             by_name[pair["to"]]["renamed_from"] = pair["from"]
     block["renames"] = renames
     block["renamed_total"] = len(renames)
+    block["renamed_grown_total"] = sum(1 for pair in renames if pair.get("grown"))
     block["renamed_ambiguous_total"] = ambiguous_renames
     if block["changed"]:
         block["verdict"] = "names_changed"
@@ -5860,11 +5985,17 @@ def _chain_lines(chain, width=80):
         wrap("    names        ", summary)
         if names.get("renamed_total"):
             for pair in names["renames"][: _CHAIN_NAME_ROWS]:
+                if pair.get("grown"):
+                    detail = (
+                        f"same first 4 KiB, bytes grew {pair['size_before']:,} -> "
+                        f"{pair['size']:,} -- one file renamed and appended to"
+                    )
+                else:
+                    detail = "same size and content hash -- the name that left and the one that entered are this one file"
                 wrap(
                     "    renamed      ",
                     f" {_fit_name(pair['from'], 24)} -> {_fit_name(pair['to'], 24)} on reading "
-                    f"{pair['step']}, same size and content hash -- the name that left and the "
-                    "one that entered are this one file",
+                    f"{pair['step']}, {detail}",
                 )
         if names.get("renamed_ambiguous_total"):
             wrap(
@@ -6014,7 +6145,16 @@ def _compare_lines(block, width=80):
     if attribution.get("moved_total"):
         rows = attribution.get("moved") or []
         total = attribution["moved_total"]
-        shown = ", ".join(f"{row['from']} -> {row['to']}" for row in rows)
+
+        def _move(row):
+            if row.get("grown"):
+                return (
+                    f"{row['from']} -> {row['to']} (appended, "
+                    f"{row['size_from']:,} -> {row['size']:,} bytes)"
+                )
+            return f"{row['from']} -> {row['to']}"
+
+        shown = ", ".join(_move(row) for row in rows)
         more = f" (+{total - len(rows)} more)" if total > len(rows) else ""
         parts.append(f"moved {total}: {shown}{more}")
     for key, label in (

@@ -112,11 +112,12 @@ def test_an_asked_for_scan_names_every_file_it_read(tmp_path):
     scan = quotamirror.scan_usage(root, manifest=True)
     facts = scan["file_facts"]
     assert [entry[0] for entry in facts] == ["a.jsonl", "b.jsonl"]
-    assert all(len(entry) == 4 for entry in facts)
+    assert all(len(entry) == 5 for entry in facts)
     size, mtime_ns, content_hash = facts[0][1], facts[0][2], facts[0][3]
     assert size == (root / "a.jsonl").stat().st_size
     assert mtime_ns == (root / "a.jsonl").stat().st_mtime_ns
     assert len(content_hash) == 16
+    assert len(facts[0][4]) == 16
 
 
 def test_the_reading_carries_the_manifest_with_its_own_total(tmp_path):

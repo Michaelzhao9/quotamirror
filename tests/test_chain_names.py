@@ -314,7 +314,14 @@ def test_a_rename_with_identical_bytes_is_named_as_one_event():
     names = chain["names"]
     assert names["renamed_total"] == 1
     assert names["renames"] == [
-        {"from": "a.jsonl", "to": "old-a.jsonl", "step": 2, "size": 10}
+        {
+            "from": "a.jsonl",
+            "to": "old-a.jsonl",
+            "step": 2,
+            "size": 10,
+            "size_before": 10,
+            "grown": False,
+        }
     ]
     assert row(chain, "a.jsonl")["renamed_to"] == "old-a.jsonl"
     assert row(chain, "old-a.jsonl")["renamed_from"] == "a.jsonl"
@@ -337,6 +344,8 @@ def test_two_files_that_share_bytes_are_not_paired_into_a_rename():
 
 
 def test_a_rename_that_also_edits_its_bytes_is_not_paired():
+    """A reading taken before 0.65.0 carries no head hash, so a rename plus an
+    edit still reads as one name leaving and another entering."""
     chain = quotamirror.reading_chain(
         [
             reading_of({"a.jsonl": "1111111111111111"}),
@@ -349,7 +358,7 @@ def test_a_rename_that_also_edits_its_bytes_is_not_paired():
     assert names["renamed_ambiguous_total"] == 0
     assert row(chain, "a.jsonl")["state"] == "left"
     assert row(chain, "old-a.jsonl")["state"] == "entered"
-    assert "a rename that also edits its bytes" in names["limit"]
+    assert "rewrites bytes inside that first 4 KiB" in names["limit"]
 
 
 def test_the_rename_line_is_not_wider_than_the_screen():
