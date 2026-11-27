@@ -240,3 +240,68 @@ def test_the_screen_says_which_file_holds_this_reading_and_which_one_it_compared
     assert "stored" in text
     assert first_name in text
     assert all(len(line) <= 80 for line in text.splitlines())
+
+
+def test_two_readings_written_in_one_second_are_ordered_by_their_suffix(tmp_path):
+    # A reading is never overwritten, so a second reading inside the same second
+    # gets a "-1" suffix. A plain name sort puts "-1" BEFORE the plain name
+    # ("-" < "."), i.e. the newer reading would be handed back as the older one.
+    store = tmp_path / "readings"
+    first = quotamirror.store_reading(
+        store, "0123456789ab", reading_payload(files=1), taken_at="2026-05-04T00:00:00Z"
+    )
+    second = quotamirror.store_reading(
+        store, "0123456789ab", reading_payload(files=2), taken_at="2026-05-04T00:00:00Z"
+    )
+
+    assert first["name"] != second["name"]
+    names = [path.name for path in quotamirror._stored_names(store, "0123456789ab")]
+    assert names == [first["name"], second["name"]]
+
+    reading, name, _, skipped = quotamirror.load_stored_reading(store, "0123456789ab")
+    assert name == second["name"]
+    assert reading["files"] == 2
+    assert skipped == 0
+
+
+def test_a_suffixed_reading_keeps_the_instant_it_was_taken(tmp_path):
+    store = tmp_path / "readings"
+    first = quotamirror.store_reading(
+        store, "0123456789ab", reading_payload(), taken_at="2026-05-04T00:00:00Z"
+    )
+    second = quotamirror.store_reading(
+        store, "0123456789ab", reading_payload(), taken_at="2026-05-04T00:00:00Z"
+    )
+
+    assert second["name"] != first["name"]
+    assert quotamirror._taken_from_name("0123456789ab-20260504T000000Z.json") == (
+        "2026-05-04T00:00:00Z"
+    )
+    assert quotamirror._taken_from_name(second["name"]) == "2026-05-04T00:00:00Z"
+
+
+def test_the_tenth_reading_in_one_second_is_not_sorted_before_the_second(tmp_path):
+    store = tmp_path / "readings"
+    written = [
+        quotamirror.store_reading(
+            store, "0123456789ab", reading_payload(files=n + 1), taken_at="2026-05-04T00:00:00Z"
+        )["name"]
+        for n in range(11)
+    ]
+
+    names = [path.name for path in quotamirror._stored_names(store, "0123456789ab")]
+    assert names == written[-5:]
+    assert names.index(written[-1]) == len(names) - 1
+
+
+def test_pruning_same_second_readings_keeps_the_newest_ones(tmp_path):
+    store = tmp_path / "readings"
+    for n in range(7):
+        quotamirror.store_reading(
+            store, "0123456789ab", reading_payload(files=n + 1), taken_at="2026-05-04T00:00:00Z"
+        )
+
+    reading, _, _, _ = quotamirror.load_stored_reading(store, "0123456789ab")
+
+    assert len(quotamirror._stored_names(store, "0123456789ab")) == 5
+    assert reading["files"] == 7

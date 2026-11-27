@@ -2479,8 +2479,28 @@ def store_corpus_key(root):
     return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
 
 
+_STORED_STEM = re.compile(r"^(?P<stamp>\d{8}T\d{6}Z)(?:-(?P<sequence>\d+))?$")
+
+
+def _stored_order(name):
+    """Where one stored reading sorts: its instant, then its place inside that second.
+
+    A name sorts naively only while the stamps differ. Two readings in the same
+    second are `...Z.json` and `...Z-1.json`, and `-` sorts before `.`, so the
+    newer file landed first; `-10` sorts before `-2` once ten readings share a
+    second. The sequence is therefore read as a number, not as text.
+    """
+    stem = Path(name).stem.split("-", 1)[-1]
+    match = _STORED_STEM.match(stem)
+    if not match:
+        # A name this module did not write still needs a place: after every
+        # stamped reading, by its own text, so it can never pass as the newest.
+        return (1, "", stem, 0)
+    return (0, match.group("stamp"), "", int(match.group("sequence") or 0))
+
+
 def _stored_names(store_dir, corpus):
-    """Every stored reading for this corpus, oldest first (the name sorts by time)."""
+    """Every stored reading for this corpus, oldest first."""
     try:
         names = [
             entry
@@ -2489,23 +2509,45 @@ def _stored_names(store_dir, corpus):
         ]
     except FileNotFoundError:
         return []
-    return sorted(names, key=lambda entry: entry.name)
+    return sorted(names, key=_stored_order)
 
 
 def _taken_from_name(name):
     """The instant a stored reading was taken, read from its own name.
 
-    The name is `<corpus>-<YYYYmmddTHHMMSSZ>.json`, so the time travels with the
-    file and no second field can disagree with it.
+    The name is `<corpus>-<YYYYmmddTHHMMSSZ>.json`, or with a `-N` suffix when
+    more than one reading landed in that second; the time travels with the file
+    and no second field can disagree with it.
     """
-    stem = Path(name).stem
-    stamp = stem.split("-", 1)[-1]
-    if len(stamp) == 16 and stamp[8] == "T":
-        return (
-            f"{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]}"
-            f"T{stamp[9:11]}:{stamp[11:13]}:{stamp[13:15]}Z"
-        )
-    return None
+    stem = Path(name).stem.split("-", 1)[-1]
+    match = _STORED_STEM.match(stem)
+    if not match:
+        return None
+    stamp = match.group("stamp")
+    return (
+        f"{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]}"
+        f"T{stamp[9:11]}:{stamp[11:13]}:{stamp[13:15]}Z"
+    )
+
+
+def _next_reading_name(store_dir, corpus, stamp):
+    """The name this reading gets: its plain stamp, or one past the highest suffix.
+
+    One past the highest, not the first free number: pruning removes the oldest
+    files, so "first free" would hand a later reading a name a pruned one used
+    to hold - and the store would then order a new reading before an old one.
+    """
+    taken = False
+    highest = 0
+    for entry in _stored_names(store_dir, corpus):
+        match = _STORED_STEM.match(entry.stem.split("-", 1)[-1])
+        if not match or match.group("stamp") != stamp:
+            continue
+        taken = True
+        highest = max(highest, int(match.group("sequence") or 0))
+    if not taken:
+        return f"{corpus}-{stamp}.json"
+    return f"{corpus}-{stamp}-{highest + 1}.json"
 
 
 def load_stored_reading(store_dir, corpus):
@@ -2541,12 +2583,8 @@ def store_reading(store_dir, corpus, payload, taken_at=None):
         raise ValueError(f"refusing symlink reading store: {store_dir}")
     store_dir.mkdir(parents=True, exist_ok=True)
     stamp = (taken_at or _utc_stamp()).replace("-", "").replace(":", "")
-    name = f"{corpus}-{stamp}.json"
-    suffix = 1
-    while (store_dir / name).exists():
-        # Two readings in the same second are two readings, not one overwritten.
-        name = f"{corpus}-{stamp}-{suffix}.json"
-        suffix += 1
+    # Two readings in the same second are two readings, not one overwritten.
+    name = _next_reading_name(store_dir, corpus, stamp)
     target = store_dir / name
     # What goes to disk is the reading, not the verdict it produced: a
     # comparison block carries the prior reading's whole manifest, so storing it
