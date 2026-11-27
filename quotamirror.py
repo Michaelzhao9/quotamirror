@@ -5991,6 +5991,122 @@ def _witness_axis(billed_days, record_sum, floor, tol, unmeasured=()):
     return block
 
 
+def _evidence_block():
+    """Defaults for the meter check's evidence split (see `_evidence_split`)."""
+    return {
+        "available": False,
+        "verdict": "not_measured",
+        "days_compared": 0,
+        "exact_days": 0,
+        "exact_receipt": 0,
+        "exact_written": 0,
+        "exact_ratio": None,
+        "short_days": 0,
+        "short_receipt": 0,
+        "short_written": 0,
+        "short_gap": 0,
+        "over_days": 0,
+        "unmeasured_days": 0,
+        "gap_is_the_witness_residual": False,
+    }
+
+
+def _evidence_split(rows, deciding, billed_days, written, witness):
+    """How much of the aggregate ratio is measured against complete records?
+
+    `receipt / as written` divides the whole bill by the records that survive,
+    so on a corpus with holes it is the bill over evidence rather than a factor
+    between two meters. The witness axis already decides, day by day, whether a
+    billed day holds the records the receipt summed; this reuses those verdicts
+    instead of re-deciding them with a second copy of the tolerance rule, and
+    keeps the complete days' ratio apart from the gap the short days carry.
+
+    The gap a short day carries is the same quantity the witness axis counts as
+    missing - but only when the two read the same days: the witness rows are
+    deliberately not window-limited and this split is, so the day sets are
+    compared rather than the totals alone.
+    """
+    block = _evidence_block()
+    state = {row["day"]: row["state"] for row in rows}
+    short_days = set()
+    for day in deciding:
+        verdict = state.get(day, "unmeasured")
+        billed = int(billed_days.get(day) or 0)
+        held = int((written or {}).get(day, 0) or 0)
+        if verdict == "exact":
+            block["exact_days"] += 1
+            block["exact_receipt"] += billed
+            block["exact_written"] += held
+        elif verdict == "remnant":
+            block["short_days"] += 1
+            block["short_receipt"] += billed
+            block["short_written"] += held
+            short_days.add(day)
+        elif verdict == "over":
+            block["over_days"] += 1
+        else:
+            block["unmeasured_days"] += 1
+    block["available"] = True
+    block["days_compared"] = len(deciding)
+    block["short_gap"] = block["short_receipt"] - block["short_written"]
+    if block["exact_written"]:
+        block["exact_ratio"] = round(block["exact_receipt"] / block["exact_written"], 4)
+    witness_days = {
+        row["day"] for row in rows if row.get("state") == "remnant"
+    }
+    witness = witness or {}
+    block["gap_is_the_witness_residual"] = bool(
+        witness.get("available")
+        and witness_days == short_days
+        and witness.get("residual_tokens") == block["short_gap"]
+    )
+    if not block["short_days"]:
+        block["verdict"] = "no_short_day"
+    elif block["exact_days"]:
+        block["verdict"] = "mixed"
+    else:
+        block["verdict"] = "no_exact_day"
+    return block
+
+
+def _evidence_line(block):
+    """The meter check's evidence split as one line, or None when it says nothing.
+
+    Silent when no deciding day is short: then the aggregate divides by a
+    complete record set and there is nothing between it and the two meters. The
+    short-day gap is printed once on the screen - the witness line three lines
+    below already carries it - so this line points at that figure instead of
+    repeating it, and prints its own number only when the day sets differ.
+    """
+    evidence = (block or {}).get("evidence") or {}
+    if not evidence.get("available") or not evidence.get("short_days"):
+        return None
+    total = evidence["days_compared"]
+    if evidence["exact_days"]:
+        head = (
+            f"    evidence     {evidence['exact_days']} of {total} day(s) exact, and on those "
+            f"the ratio is {evidence['exact_ratio']:.2f}x | the {evidence['short_days']} short "
+            "day(s) carry the gap"
+        )
+    else:
+        head = (
+            f"    evidence     no day among the {total} holds the records the receipt bills, so "
+            f"the ratio above divides the whole bill by an incomplete corpus | the "
+            f"{evidence['short_days']} short day(s) carry the gap"
+        )
+    witness_available = bool((block.get("witness") or {}).get("available"))
+    if evidence.get("gap_is_the_witness_residual"):
+        tail = "; the amount they are short by is the missing amount the witness line counts"
+    elif witness_available:
+        tail = (
+            f"; they are short by {_fmt(evidence['short_gap'])} token(s), which is not the "
+            "amount the witness line counts"
+        )
+    else:
+        tail = f"; they are short by {_fmt(evidence['short_gap'])} token(s)"
+    return head + tail
+
+
 def _quiet_meter_check(
     billed_days,
     transcript_days,
@@ -6038,6 +6154,7 @@ def _quiet_meter_check(
         "min_day_ratio": None,
         "reason": None,
     }
+    block["evidence"] = _evidence_block()
     block.update(_model_axis({}, {}, [], tol))
     block["witness"] = _witness_axis(
         billed_days, transcript_written, floor, tol, written_unknown
@@ -6103,6 +6220,9 @@ def _quiet_meter_check(
         block["ratio_deduped"] = round(receipt / deduped, 4)
     if written:
         block["ratio_record_sum"] = round(receipt / written, 4)
+    block["evidence"] = _evidence_split(
+        witness_rows, deciding, billed_days, transcript_written, block["witness"]
+    )
 
     def _matches(ratio):
         return ratio is not None and abs(ratio - 1) <= tol
@@ -6797,6 +6917,13 @@ def render_quiet(payload):
             ratios.append(f"receipt / deduped {block['ratio_deduped']:.2f}x")
         if ratios:
             lines.append("    " + " | ".join(ratios))
+        evidence_line = _evidence_line(block)
+        if evidence_line:
+            # The ratio above divides the whole bill by the records that
+            # survive. Until its composition is stated, it reads as a constant
+            # factor between two meters - and the gap it names is printed a
+            # second time, unlinked, as the witness line's missing amount.
+            lines.append(evidence_line)
         if block.get("days_matching_individually") is not None:
             # The aggregate can match while no single day does, so the pairs are
             # printed beside it rather than implied by it.
