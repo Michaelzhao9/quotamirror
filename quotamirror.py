@@ -2385,6 +2385,10 @@ ATTRIBUTION_LIMIT = 10
 
 READING_STORE_DEFAULT = Path.home() / ".cache" / "quotamirror" / "readings.json"
 
+# How many stored `quiet --store` readings are kept per corpus. A short recent
+# history is what a chain of comparisons needs; beyond that the store is a log.
+STORE_MAX_READINGS = 5
+
 
 def reading_of(receipt):
     """The token numbers a second reading must agree with, keyed by what they count.
@@ -2462,6 +2466,116 @@ def record_reading(store_path, cache_path, receipt, recorded_at=None):
         except FileNotFoundError:
             pass
     return store, reading
+
+
+def store_corpus_key(root):
+    """A stable short name for one transcript corpus, so readings can find each other.
+
+    The key is the resolved path, not the receipt: what a reading describes is
+    the set of files it read. Resolved, because `~/x` and `/Users/.. /x` are the
+    same corpus and must not fill two stores.
+    """
+    resolved = str(Path(root).resolve())
+    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:12]
+
+
+def _stored_names(store_dir, corpus):
+    """Every stored reading for this corpus, oldest first (the name sorts by time)."""
+    try:
+        names = [
+            entry
+            for entry in Path(store_dir).iterdir()
+            if entry.is_file() and entry.suffix == ".json" and entry.name.startswith(f"{corpus}-")
+        ]
+    except FileNotFoundError:
+        return []
+    return sorted(names, key=lambda entry: entry.name)
+
+
+def _taken_from_name(name):
+    """The instant a stored reading was taken, read from its own name.
+
+    The name is `<corpus>-<YYYYmmddTHHMMSSZ>.json`, so the time travels with the
+    file and no second field can disagree with it.
+    """
+    stem = Path(name).stem
+    stamp = stem.split("-", 1)[-1]
+    if len(stamp) == 16 and stamp[8] == "T":
+        return (
+            f"{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]}"
+            f"T{stamp[9:11]}:{stamp[11:13]}:{stamp[13:15]}Z"
+        )
+    return None
+
+
+def load_stored_reading(store_dir, corpus):
+    """The newest stored reading for this corpus, or a stated absence.
+
+    Returns `(reading, name, taken_at, skipped)`. A file that cannot be read as
+    a reading is skipped and counted - never treated as the newest reading and
+    never allowed to stop the run, because a store is a convenience and an
+    unreadable convenience is not a reason to refuse the measurement in hand.
+    """
+    skipped = 0
+    for entry in reversed(_stored_names(store_dir, corpus)):
+        try:
+            reading = read_prior_reading(entry)
+        except ValueError:
+            skipped += 1
+            continue
+        return reading, entry.name, _taken_from_name(entry.name), skipped
+    return None, None, None, skipped
+
+
+def store_reading(store_dir, corpus, payload, taken_at=None):
+    """Write this reading beside the earlier ones for the same corpus.
+
+    One file per reading, `<corpus>-<stamp>.json`, mode 0600, written through a
+    temporary file so a crash leaves the previous readings intact. Only the
+    newest `STORE_MAX_READINGS` are kept per corpus: a store that grows without
+    bound is a corpus of its own, and nothing here needs more than a short
+    recent history.
+    """
+    store_dir = Path(store_dir)
+    if store_dir.is_symlink():
+        raise ValueError(f"refusing symlink reading store: {store_dir}")
+    store_dir.mkdir(parents=True, exist_ok=True)
+    stamp = (taken_at or _utc_stamp()).replace("-", "").replace(":", "")
+    name = f"{corpus}-{stamp}.json"
+    suffix = 1
+    while (store_dir / name).exists():
+        # Two readings in the same second are two readings, not one overwritten.
+        name = f"{corpus}-{stamp}-{suffix}.json"
+        suffix += 1
+    target = store_dir / name
+    # What goes to disk is the reading, not the verdict it produced: a
+    # comparison block carries the prior reading's whole manifest, so storing it
+    # would double the file and make a reading a record of its own comparisons.
+    document = {
+        key: value
+        for key, value in payload.items()
+        if key not in ("reading_compare", "reading_chain", "reading_store")
+    }
+    handle, temporary = tempfile.mkstemp(prefix=f".{name}.", dir=store_dir)
+    try:
+        os.fchmod(handle, 0o600)
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            json.dump(document, out, indent=2, sort_keys=True)
+            out.write("\n")
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(temporary, target)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    kept = _stored_names(store_dir, corpus)
+    pruned = 0
+    for old in kept[:-STORE_MAX_READINGS]:
+        old.unlink()
+        pruned += 1
+    return {"name": name, "kept": len(kept) - pruned, "pruned": pruned}
 
 
 def revise_report(store, cache_path, receipt):
@@ -6804,6 +6918,66 @@ def _fold_lines(lines, width=80):
     return folded
 
 
+def _short_path(text, width=80, indent=29):
+    """A path that fits a continuation line, shortened from the left with a mark.
+
+    A path has no spaces to fold on, so it is the one token that cannot be
+    wrapped: shortening it is preferable to a line that runs off the screen,
+    and the mark says a prefix was dropped. The whole string stays in --json.
+    """
+    limit = width - indent
+    if len(text) <= limit:
+        return text
+    return "..." + text[-(limit - 3) :]
+
+
+def _store_lines(block, width=80):
+    """Render where this reading was kept, and which stored one it compared with.
+
+    Three statements, never one: where *this* run went, what it was written as,
+    and - when the store supplied the prior - which file that prior came from. A
+    row that named only the directory would leave the reader unable to tell a
+    first reading from a comparison with something months old, and the prior's
+    own file name is what a later `--compare-reading` would need.
+    """
+    if not block:
+        return []
+    lines = []
+
+    def emit(label, text):
+        head = " " * 17 + f"{label:<8}"
+        if len(head + text) <= width:
+            lines.append(head + text)
+            return
+        current = head
+        for word in text.split():
+            if current.strip() and len(current) + 1 + len(word) > width:
+                lines.append(current.rstrip())
+                current = " " * 26 + word
+            else:
+                current += (" " if current.strip() else "") + word
+        lines.append(current.rstrip())
+
+    directory = _short_path(block["dir"], width)
+    held = f"{block['kept']} reading(s) held for this corpus in {directory}"
+    if directory != block["dir"]:
+        held += " (full path in --json)"
+    emit("store", held)
+    emit("saved", f"this one written as {block['name']}")
+    if block.get("pruned"):
+        emit("", f"{block['pruned']} older reading(s) pruned, {STORE_MAX_READINGS} kept")
+    if block.get("skipped"):
+        emit("", f"{block['skipped']} stored file(s) could not be read and were skipped")
+    prior = block.get("prior") or {}
+    if prior:
+        emit(
+            "stored",
+            f"the prior above is {prior['name']}"
+            + (f", taken {prior['taken_at']}" if prior.get("taken_at") else ""),
+        )
+    return lines
+
+
 def render_quiet(payload):
     lines = ["SILENT DAYS (which days are quiet, and which only look quiet)", ""]
     lines.append(f"  receipt     {_range(*payload['receipt_span']) if payload['receipt_span'] else 'none'}")
@@ -6866,6 +7040,7 @@ def render_quiet(payload):
         lines.extend(_chain_lines(payload.get("reading_chain")))
     elif reading:
         lines.append(f"    reading      reading not identified -- {reading['reason']}")
+    lines.extend(_store_lines(payload.get("reading_store")))
     if not payload["available"] or payload["verdict"] in {
         "no_day_table",
         "no_transcripts",
@@ -8149,6 +8324,15 @@ def main(argv=None):
             f"so a comparison can name the file that moved (capped at {MANIFEST_LIMIT} files)"
         ),
     )
+    quiet.add_argument(
+        "--store",
+        metavar="DIR",
+        default=None,
+        help=(
+            "keep this reading in DIR, so the next run can compare against it without a saved "
+            "file; needs --manifest (a stored reading that cannot name a file cannot be chained)"
+        ),
+    )
     quiet.add_argument("--json", action="store_true", help="machine-readable payload")
 
     nested = sub.add_parser(
@@ -8294,8 +8478,46 @@ def main(argv=None):
         if not root.exists():
             print(f"quotamirror: no transcripts at {root}", file=sys.stderr)
             return 2
-        scan = scan_usage(root, max_files=args.max_files, manifest=args.manifest)
         priors = []
+        store_dir = None
+        corpus = None
+        store_prior = None
+        store_prior_reason = None
+        store_skipped = 0
+        if args.store:
+            store_dir = Path(args.store)
+            if store_dir.is_symlink():
+                print(
+                    f"quotamirror: refusing symlink reading store: {store_dir}",
+                    file=sys.stderr,
+                )
+                return 2
+            if not args.manifest:
+                print(
+                    "quotamirror: --store needs --manifest: a stored reading that cannot name "
+                    "a file cannot be chained",
+                    file=sys.stderr,
+                )
+                return 2
+            corpus = store_corpus_key(root)
+            if args.compare_reading:
+                store_prior_reason = (
+                    "--compare-reading was given, so the stored reading is not used as the prior"
+                )
+            else:
+                block, name, taken_at, store_skipped = load_stored_reading(store_dir, corpus)
+                if block is not None:
+                    store_prior = {"name": name, "taken_at": taken_at}
+                    store_prior_reason = None
+                    priors.append(block)
+                elif store_skipped:
+                    store_prior_reason = (
+                        f"{store_skipped} stored reading(s) for this corpus could not be read "
+                        "as readings"
+                    )
+                else:
+                    store_prior_reason = "no stored reading for this corpus yet"
+        scan = scan_usage(root, max_files=args.max_files, manifest=args.manifest)
         for supplied in args.compare_reading or []:
             try:
                 priors.append(read_prior_reading(supplied))
@@ -8315,6 +8537,31 @@ def main(argv=None):
         payload["transcript_root"] = str(root.resolve())
         payload["files"] = len(scan["files"])
         payload = redact_home(payload)
+        if store_dir is not None:
+            # The comparison sentence names the flag it lacked; when the store
+            # was asked for a prior and holds none, that is the true reason.
+            comparison = payload.get("reading_compare") or {}
+            if not store_prior and not args.compare_reading and not comparison.get("available"):
+                comparison["reason"] = (
+                    "no stored reading for this corpus yet and --compare-reading was not "
+                    "given, so this reading stands alone"
+                )
+            try:
+                written = store_reading(store_dir, corpus, payload)
+            except (OSError, ValueError) as exc:
+                print(f"quotamirror: cannot store this reading: {exc}", file=sys.stderr)
+                return 2
+            payload["reading_store"] = {
+                "available": True,
+                "corpus": corpus,
+                "dir": redact_home({"dir": str(store_dir)})["dir"],
+                "name": written["name"],
+                "kept": written["kept"],
+                "pruned": written["pruned"],
+                "skipped": store_skipped,
+                "prior": store_prior,
+                "prior_reason": store_prior_reason,
+            }
         if args.json:
             print(json.dumps(payload, indent=2, sort_keys=True))
         else:
