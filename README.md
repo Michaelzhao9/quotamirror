@@ -605,6 +605,23 @@ activity` (transcripts yes, the message table has no row — it lags) and `silen
 fifth term is printed only when it is non-zero, so the terms still add up to the window; a
 silent day is printed as an absence and carries no number.
 
+**A silent count in runs, not a range.** Silent days are rarely contiguous: on the machine this
+was written against, 138 of them sit in 8 runs inside a 167-day span, because 21 measured days
+and 8 days the receipt bills fall between them. Until 0.66.0 the line read `silent 138 day(s):
+2026-05-05 .. 2026-10-18` — 167 dates behind a count of 138, and a reader who did not count the
+dates read the 29 record days inside that span as silent. It now names the runs and the number of
+record days the span encloses, so the two dates cannot be read as the set:
+
+```
+  silent 138 day(s) in 8 run(s), 2026-05-05 .. 2026-10-18
+         -- 29 day(s) holding a record inside that span, so those two dates do
+         not bound the set; no record on either side, printed as an absence and
+         not as zero
+```
+
+The three numbers add up to the span (138 + 29 = 167), so a reader can redo the arithmetic. A
+single contiguous run keeps the plain range, because there the range is the set.
+
 **The two totals are printed and not reconciled.** `measured` says both stores hold a record on
 a day — not that they agree on the amount, and on the corpus this was built against the two
 totals differ by a multiple on the very days both reach. Both are printed side by side with

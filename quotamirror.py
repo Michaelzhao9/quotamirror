@@ -830,6 +830,28 @@ def _range(first, last):
     return f"{first} .. {last}"
 
 
+def _date_runs(days):
+    """Group sorted ISO dates into contiguous runs: [(first, last, count), ...].
+
+    A first..last range describes a set only when the set has no holes. This
+    machine's 138 silent days sit in 8 runs inside a 167-day span, so the range
+    alone would let a reader count 167 dates against a printed 138 and would
+    read the 29 record days inside that span as silent.
+    """
+    runs = []
+    for day in days:
+        if runs and (date.fromisoformat(runs[-1][1]) + timedelta(days=1)).isoformat() == day:
+            runs[-1] = (runs[-1][0], day, runs[-1][2] + 1)
+        else:
+            runs.append((day, day, 1))
+    return runs
+
+
+def _span_days(first, last):
+    """Inclusive day count of a first..last span, for arithmetic a reader can redo."""
+    return (date.fromisoformat(last) - date.fromisoformat(first)).days + 1
+
+
 KNOWN_KEYS = ("dailyActivity", "dailyModelTokens", "modelUsage")
 
 
@@ -7442,10 +7464,24 @@ def render_quiet(payload):
     silents = [row["date"] for row in payload["rows"] if row["kind"] == "silent"]
     if silents:
         lines.append("")
-        lines.append(
-            f"  silent {len(silents)} day(s): {_range(silents[0], silents[-1])} "
-            "-- no record on either side, printed as an absence and not as zero"
-        )
+        runs = _date_runs(silents)
+        if len(runs) == 1:
+            lines.append(
+                f"  silent {len(silents)} day(s): {_range(silents[0], silents[-1])} "
+                "-- no record on either side, printed as an absence and not as zero"
+            )
+        else:
+            # The range is not the set: name the runs and the record days they
+            # enclose, so the count and the two dates cannot be read as one
+            # block of silence.
+            held = _span_days(silents[0], silents[-1]) - len(silents)
+            lines.append(
+                f"  silent {len(silents)} day(s) in {len(runs)} run(s), "
+                f"{_range(silents[0], silents[-1])} -- {held} day(s) holding a "
+                "record inside that span, so those two dates do not bound the "
+                "set; no record on either side, printed as an absence and not "
+                "as zero"
+            )
     lines.append("")
     lines.append(f"VERDICT: {payload['verdict']}")
     lines.append(f"  {payload['reason']}")
