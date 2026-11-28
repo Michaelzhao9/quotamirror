@@ -276,9 +276,9 @@ number the receipt in hand carries, so the row says whose number it is:
     transcripts as written  2,800,000  (every usage record)
     transcripts deduped     1,260,000  (one message counted once)
     receipt / as written 1.46x | receipt / deduped 3.24x
-    evidence     14 of 24 day(s) exact, and on those the ratio is 1.00x | the 10 short day(s) carry the gap; the amount they are short by is the missing amount the witness line counts
-    per day      0 of 24 day(s) agree with their own pair (tolerance 2%) | 24 receipt-heavy, 0 transcript-heavy | widest 4.20x (2026-09-03), narrowest 2.10x (2026-08-21) -- no_agreement
-    by model     0 of 3 model(s) agree | 3 receipt-heavy, 0 transcript-heavy | ratio 3.00x..8.00x | largest gap claude-alpha (71% of the excess) -- every_model_receipt_heavy
+    evidence     14 of 24 day(s) match the record sum exactly, and on those the ratio is 1.00x | the 10 short day(s) carry the gap; the amount they are short by is the missing amount the witness line counts
+    per day      against the deduped figure: 0 of 24 day(s) agree with their own pair (tolerance 2%) | 24 receipt-heavy, 0 transcript-heavy | widest 4.20x (2026-09-03), narrowest 2.10x (2026-08-21) -- no_agreement
+    by model     against the deduped figure: 0 of 3 model(s) agree | 3 receipt-heavy, 0 transcript-heavy | ratio 3.00x..8.00x | largest gap claude-alpha (71% of the excess) -- every_model_receipt_heavy
     witness      14 day(s) exact | 10 short (2,780,000 billed, 1,280,000 missing) -- checked 31.9% of 4,080,000 billed tokens; exact where evidence survives
   meter check: neither -- neither transcript figure is within tolerance of the receipt, so repeated writes do not account for the gap on their own and the remainder is not explained here
 
@@ -336,8 +336,9 @@ are printed with the verdict so the run can be repeated.
 **The aggregate ratio states what it divides by.** `receipt / as written 1.46x` divides the whole
 bill by the records that survive, so on a corpus with holes it is not a factor between two meters
 — it is the bill over evidence. The `evidence` line splits the deciding days by the witness
-verdicts printed below it (`14 of 24 day(s) exact, and on those the ratio is 1.00x`) and says where
-the gap sits. The short-day gap is not printed twice: when the days that split counts are the same
+verdicts printed below it (`14 of 24 day(s) match the record sum exactly, and on those the ratio is
+1.00x`) and says where the gap sits. The short-day gap is not printed twice: when the days that
+split counts are the same
 days the witness line counts, the line points at that figure instead of repeating it, and it prints
 its own number only when the two day sets differ — the witness axis is deliberately not
 window-limited and the meter check is, so the sets have to be compared, not assumed.
@@ -353,6 +354,16 @@ aggregate did not match either figure and the labels are printed as counts only;
 means no aggregate was available. The per-day axis never changes the aggregate verdict; it
 stops a cancelled-out total from being read as one.
 
+**A row that divides by one figure says which.** The block prints two transcript figures, and the
+per-day axis divides by whichever one the aggregate matched — both of them when both matched.
+Until 0.67.0 that divisor was left implicit, and on a real receipt the screen contradicted itself
+on adjacent lines: `16 of 27 day(s) exact, and on those the ratio is 1.00x` (against the record
+sum) directly above `0 of 27 day(s) agree with their own pair` (against the deduped total). Both
+sentences were true and neither said what it divided by. The rows now read `against the record
+sum: …`, `against the deduped figure: …` or `against both transcript figures: …`, the same phrase
+the aggregate ratios use, and `per_day_basis` / `by_model_basis` carry the same statement in
+`--json`.
+
 **A gap in one model can hide behind a gap in another.** Both axes above sum every model
 together, so a model the receipt counts twice as heavily and a model it counts half as heavily
 cancel and print as agreement. The same deciding days are therefore split by model name, with
@@ -366,7 +377,9 @@ only one side names is listed as `receipt only` or `transcripts only` and counte
 a renamed model and a model the other store does not meter leave the same hole, so the line
 reports the hole instead of choosing a cause. On the corpus this was built against no model
 agrees and every one is receipt-heavy, with the factor varying by model: the residual is not
-one model's artifact, and it is still not attributed here.
+one model's artifact, and it is still not attributed here. This axis' transcript side is the
+deduped total (one message counted once), so its row names that figure rather than leaving the
+reader to guess which of the two printed totals it divided by.
 
 **The ratio divides by the records that survive, so it says which days still have evidence.**
 A factor computed against a corpus that lost records is not a meter factor. The `witness` line

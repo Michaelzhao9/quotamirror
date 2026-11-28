@@ -105,7 +105,9 @@ def test_meter_check_splits_its_ratio_by_surviving_evidence(tmp_path):
 
 def test_text_prints_the_exact_day_ratio_beside_the_aggregate(tmp_path):
     text = flat(quotamirror.render_quiet(mixed_corpus(tmp_path)))
-    assert "1 of 2 day(s) exact" in text
+    # "exact" is exact against the record sum, and the row now says so: the
+    # per-day row below it divides by the deduped figure instead.
+    assert "1 of 2 day(s) match the record sum exactly" in text
     assert "on those the ratio is 1.00x" in text
 
 

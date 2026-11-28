@@ -4662,6 +4662,7 @@ def _model_axis(billed_by_model, transcript_by_model, deciding, tol):
     """
     fragment = {
         "by_model_verdict": "not_measured",
+        "by_model_basis": None,
         "by_model_rows": [],
         "models_compared": 0,
         "models_agreeing": 0,
@@ -4715,6 +4716,11 @@ def _model_axis(billed_by_model, transcript_by_model, deciding, tol):
             }
         )
     fragment["by_model_rows"] = rows
+    # The per-model transcript total is the deduped one (the scan's `by_model`
+    # carries one message with its largest bucket value), while the block above
+    # prints the record sum as well. The row names its divisor for the same
+    # reason the per-day row does.
+    fragment["by_model_basis"] = "deduped" if rows else None
     fragment["models_compared"] = len(rows)
     fragment["models_agreeing"] = sum(1 for row in rows if row["verdict"] == "agree")
     fragment["models_receipt_heavy"] = sum(
@@ -6383,6 +6389,25 @@ def _evidence_split(rows, deciding, billed_days, written, witness):
     return block
 
 
+_BASIS_WORD = {
+    "record_sum": "the record sum",
+    "deduped": "the deduped figure",
+    "both_figures": "both transcript figures",
+}
+
+
+def _basis_phrase(block, key):
+    """The divisor a row uses, named, or an empty string when the payload omits it.
+
+    The meter block prints two transcript figures. A row that divides by one of
+    them says which, because on a real receipt a per-day agreement count and a
+    per-day "exact" count taken against different figures sit on adjacent lines
+    and read as a contradiction until each names its own divisor.
+    """
+    word = _BASIS_WORD.get((block or {}).get(key) or "")
+    return f"against {word}: " if word else ""
+
+
 def _evidence_line(block):
     """The meter check's evidence split as one line, or None when it says nothing.
 
@@ -6398,9 +6423,9 @@ def _evidence_line(block):
     total = evidence["days_compared"]
     if evidence["exact_days"]:
         head = (
-            f"    evidence     {evidence['exact_days']} of {total} day(s) exact, and on those "
-            f"the ratio is {evidence['exact_ratio']:.2f}x | the {evidence['short_days']} short "
-            "day(s) carry the gap"
+            f"    evidence     {evidence['exact_days']} of {total} day(s) match the record sum "
+            f"exactly, and on those the ratio is {evidence['exact_ratio']:.2f}x | the "
+            f"{evidence['short_days']} short day(s) carry the gap"
         )
     else:
         head = (
@@ -6461,6 +6486,7 @@ def _quiet_meter_check(
         "ratio_deduped": None,
         "ratio_record_sum": None,
         "per_day_verdict": "not_measured",
+        "per_day_basis": None,
         "days_matching_individually": None,
         "days_receipt_heavy": None,
         "days_transcript_heavy": None,
@@ -6580,6 +6606,16 @@ def _quiet_meter_check(
     if deduped_hit:
         matched_axes.append(transcript_days)
     axes = matched_axes or [transcript_days]
+    # The two transcript figures are different divisors and the block prints
+    # both, so the per-day row has to name the one it divided by: on a real
+    # receipt "N day(s) exact, and on those the ratio is 1.00x" sits directly
+    # above "0 of M day(s) agree with their own pair" about the same days.
+    if len(axes) == 2:
+        block["per_day_basis"] = "both_figures"
+    elif axes[0] is transcript_written:
+        block["per_day_basis"] = "record_sum"
+    else:
+        block["per_day_basis"] = "deduped"
     per_day_tolerance = tol
     agreeing = 0
     for day in deciding:
@@ -7303,7 +7339,8 @@ def render_quiet(payload):
             # The aggregate can match while no single day does, so the pairs are
             # printed beside it rather than implied by it.
             lines.append(
-                f"    per day      {block['days_matching_individually']} of "
+                f"    per day      {_basis_phrase(block, 'per_day_basis')}"
+                f"{block['days_matching_individually']} of "
                 f"{block['days_compared']} day(s) agree with their own pair "
                 f"(tolerance {block['tolerance']:.0%}) | "
                 f"{block['days_receipt_heavy']} receipt-heavy, "
@@ -7316,7 +7353,8 @@ def render_quiet(payload):
             # and an opposite gap in another cancel there. This line splits the
             # same days by name and says how much of the excess sits in one.
             axis = (
-                f"    by model     {block['models_agreeing']} of {block['models_compared']} "
+                f"    by model     {_basis_phrase(block, 'by_model_basis')}"
+                f"{block['models_agreeing']} of {block['models_compared']} "
                 f"model(s) agree | {block['models_receipt_heavy']} receipt-heavy, "
                 f"{block['models_transcript_heavy']} transcript-heavy"
             )
